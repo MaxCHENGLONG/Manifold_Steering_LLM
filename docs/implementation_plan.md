@@ -39,6 +39,8 @@
 - [x] 单卡冒烟测试全部通过（节点 n454，日志 `$PROJ/logs/smoke_gpu1_20261106-2308.log`）：vLLM 生成（需 `VLLM_USE_FLASHINFER_SAMPLER=0`）、HF 前向 hook（零向量逐字一致，4 倍范数随机向量使输出崩坏）、GLP 多层采样
 - [x] **G0 完成（2026-11-06）**
 - [x] `manifold_guard/layers.py`、`stats.py` 及单元测试（`tests/`，在 CPU 上几秒跑完）（2026-11-06）
+- [x] 逐层统计代码（2026-11-07）：`manifold_guard/corpus.py`、`scripts/generate_onpolicy_chat.py`、`scripts/collect_layer_stats.py`、`slurm/layer_stats.sbatch`；在 Qwen2.5-1.5B-Instruct 上用 100 万 token 合成文本冒烟通过（约 5.2 万 token/s，含 28 层统计）
+- [ ] 下载 `corpus` 组（FineWeb 与 UltraChat 各 1 个分片，约 2.4 GB），提交 Qwen2.5-1.5B-Instruct 的逐层统计作业
 - [x] Llama-3.2-1B / Llama-3.1-8B 许可已通过，下载 `llama` 组（2026-11-06）：Llama-3.2-1B-Instruct 2.4 GB、Llama-3.1-8B-Instruct 15 GB、`glp-llama8b-d6` 13 GB
 - [ ] 阶段 0 MVP
 
@@ -80,6 +82,10 @@ apptainer shell --nv -B $PROJ $SIF
 msm python 脚本.py
 mst python 脚本.py
 mst torchrun --standalone --nproc_per_node=4 train.py
+# 单元测试（CPU 上几秒）；VS Code 终端本身就在容器里，改用 /opt/venvs/main/bin/python -m pytest -q
+cd $REPO && msm python -m pytest -q
+# 逐层统计（1 卡）：先生成 on-policy 对话，再逐层累计；结果在 $REPO/stats/<模型名>/
+cd $REPO && sbatch slurm/layer_stats.sbatch Qwen/Qwen2.5-1.5B-Instruct
 # 4 卡批处理作业
 cd $REPO && sbatch slurm/ddp_smoke.sbatch
 # 查看作业与日志
@@ -124,10 +130,12 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
 | `$PROJ` 指向不对 | 原 `.bashrc` 里已有 `PROJ` 的定义 | `PROJ` 指个人目录，代码仓库用 `REPO` |
 | `ssh -T git@github.com` 被拒 | 没有 `~/.ssh/config`，非默认名字的密钥不会被使用 | 写 config，指定 `id_ed25519_github` |
 | scp 报 `dest open ... Failure` | 目标目录不存在 | 先 `ssh arrhenius "mkdir -p 目录"` 再上传 |
+| VS Code 终端里 `msm` 报 `apptainer: command not found`，也没有 `sbatch` | VS Code 服务本身跑在容器里，终端也在容器里 | 直接用 `/opt/venvs/main/bin/python`；下载、提交作业在登录节点或宿主机的 SSH 终端里做 |
+| 导入上游代码后，`third_party/weight-steering` 显示有改动 | Python 往 submodule 里写了 `__pycache__` | `manifold_guard/upstream.py` 导入上游模块时关闭字节码写入 |
 
 ### 下一步
 
-1. 阶段 0 MVP（Qwen2.5-1.5B-Instruct）：`manifold_guard/layers.py`、`stats.py` 已完成；接下来写逐层统计脚本，在自然语料上累计每层均值与协方差。
+1. 阶段 0 MVP（Qwen2.5-1.5B-Instruct）：逐层统计代码已完成。在 GPU 节点上运行 `msm python tools/download_assets.py --set corpus` 下载语料，再提交 `sbatch slurm/layer_stats.sbatch Qwen/Qwen2.5-1.5B-Instruct`（估计 20–30 分钟，其中生成对话的耗时还没实测）；结果出来后画每层的特征值谱存档。
 2. 高斯与 PCA 打分器、阈值校准；用 weight-steering 的数据算 sycophancy 的激活 steering 向量与权重 steering 向量。
 3. 扫描 k，teacher-forcing 打分，画出"每层离流形分数 / 行为指标 / 能力指标"随 k 的曲线，判定 G1。
 
@@ -135,7 +143,7 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
 
 顶层仓库是 `Manifold_Steering_LLM`，三个上游仓库作为 git submodule 放在 `third_party/` 下，自己的代码全部放在 `manifold_guard` 包里。上游只改两处入口：加参数、接 hook，其余当库调用。目前三个 submodule 指向上游原仓库；开始改上游代码之前，先 fork 到自己的 GitHub，再把 submodule 地址换成 fork。
 
-截至 2026-11-06，仓库里已有 `containers/`、`docs/`、`slurm/`、`smoke/`、`tools/` 和 `third_party/`；`manifold_guard/`、`scripts/`、`configs/`、`tests/` 从阶段 0 开始逐步建立。
+截至 2026-11-07，仓库里已有 `containers/`、`docs/`、`slurm/`、`smoke/`、`tools/`、`third_party/`、`manifold_guard/`、`scripts/` 和 `tests/`；`configs/` 等随后续阶段建立。实验产物默认写在仓库里，并已加入 .gitignore：`data/`（on-policy 对话）、`stats/`（逐层统计）、`results/`（实验结果）。
 
 ```
 Manifold_Steering_LLM/
@@ -144,23 +152,28 @@ Manifold_Steering_LLM/
     generative_latent_prior/  # GLP 权重加载、sample_on_manifold
     persona_vectors/          # 为 Qwen 生成激活 steering 向量（.pt）
   containers/                 # 镜像定义文件与锁文件（已有）
-  slurm/                      # sbatch 模板（已有：ddp_smoke.sbatch）
+  slurm/                      # sbatch 模板（已有：ddp_smoke.sbatch、layer_stats.sbatch）
   smoke/                      # 冒烟测试（已有）
   tools/                      # 模型与数据集下载脚本（已有）
   docs/                       # 本计划（已有）
   manifold_guard/             # 新包；镜像只读，通过 PYTHONPATH 导入
-    layers.py                 # 定位 model.layers、读写 hidden state（兼容 tuple 输出）
-    stats.py                  # 流式均值/协方差，保存与加载
+    upstream.py               # 从 third_party 导入上游模块（已有）
+    layers.py                 # 定位 model.layers、读写 hidden state（兼容 tuple 输出）（已有）
+    stats.py                  # 流式均值/协方差，保存与加载（已有）
+    corpus.py                 # 逐层统计语料：读取、按文档切分、打包（已有）
+    runinfo.py                # 结果目录里记录的运行环境（已有）
     scorers/                  # base.py, gauss.py, pca.py, glp.py
     correctors.py             # 投影/修正算子
     guard.py                  # ManifoldGuard 上下文管理器
     calibrate.py              # 逐层分位数阈值
     trajectory/               # M3：data.py, model.py, train.py
     reg.py                    # M4：训练时正则 ManifoldPenalty
-  scripts/                    # 每个实验一个入口脚本
+  scripts/                    # 每个实验一个入口脚本（已有：generate_onpolicy_chat.py、collect_layer_stats.py）
   configs/                    # omegaconf yaml：模型、层、打分器、阈值
-  tests/
-  results/                    # gitignore
+  tests/                      # 单元测试（已有）
+  data/                       # on-policy 对话（gitignore）
+  stats/                      # 逐层统计（gitignore）
+  results/                    # 实验结果（gitignore）
 ```
 
 | 文件 | 作用 | 基于 / 改自 | 阶段 | 估计行数 |
@@ -173,6 +186,8 @@ Manifold_Steering_LLM/
 | `manifold_guard/calibrate.py` | 自然激活上的分数分位数 → 阈值 τ_l | 新写 | 0 | 80 |
 | `manifold_guard/trajectory/` | 跨层条件先验 p(h_l \| h_{l-1}) 的数据、模型、训练 | GLP 的去噪器结构 | 2 后半 | 400 |
 | `manifold_guard/reg.py` | 训练时离流形惩罚 `ManifoldPenalty` | 新写 | 2 后半 | 80 |
+| `manifold_guard/corpus.py` | 语料读取、按文档哈希切成 fit/calib/holdout、按长度打包 | 新写 | 0 | 130 |
+| `scripts/generate_onpolicy_chat.py` | vLLM 生成 on-policy 对话，保存 token id | 新写 | 0 | 100 |
 | `scripts/collect_layer_stats.py` | 在语料上累计统计 | 新写 | 0 | 120 |
 | `scripts/compute_diffmean_vectors.py` | 从 D⁺/D⁻ 算激活 steering 向量（persona_vectors 格式） | 新写 | 0 | 100 |
 | `scripts/validate_scorers.py` | 打分器 AUROC 验证 | 新写 | 0–1 | 120 |
@@ -251,7 +266,7 @@ flowchart LR
 
 ### 目录布局
 
-以 BASE = `/nobackup/proj/disk/naiss2025-22-1730/personal/licheng`（即 `$PROJ`）为根。下表是 2026-11-06 的实际情况。
+以 BASE = `/nobackup/proj/disk/naiss2025-22-1730/personal/licheng`（即 `$PROJ`）为根。下表是 2026-11-07 的实际情况。
 
 | 目录 | 用途 | 对应环境变量 | 状态 |
 | --- | --- | --- | --- |
@@ -263,7 +278,8 @@ flowchart LR
 | `logs/` | Slurm 标准输出与错误输出、冒烟测试日志 | — | 已有 |
 | `torch_cache/` | torch 的下载缓存 | TORCH_HOME | 尚未创建，首次使用时自动创建 |
 | `cache/` | pip、Triton、TorchInductor 的持久缓存 | PIP_CACHE_DIR、TRITON_CACHE_DIR、TORCHINDUCTOR_CACHE_DIR | 待建 |
-| `stats/`、`results/`、`ckpt/` | 逐层统计、实验结果、LoRA 检查点 | — | 待建 |
+| `Manifold_Steering_LLM/` 下的 `data/`、`stats/`、`results/` | on-policy 对话、逐层统计、实验结果；默认写在仓库里，已加入 .gitignore | — | 运行时自动创建 |
+| `ckpt/` | LoRA 检查点 | — | 待建；阶段 1 训练时按同样原则放在仓库里 |
 
 原计划里的 `hf_home/`（与 `hf_cache/` 分开存 token）和 `envs/`（镜像之上的薄包目录）已经建好，但没有使用，目前都是空目录；`code/manifold-steer/` 改成了 `Manifold_Steering_LLM/`。
 
@@ -311,19 +327,24 @@ API key（Anthropic、OpenAI、HF、wandb）放在 `$HOME` 下权限为 600 的�
 
 - [x] 确认登录节点是 x86_64、GPU 节点是 aarch64；GPU 节点可以出网。
 - [ ] 用 `projinfo` 和配额命令确认账户与配额、项目目录的空间与文件数配额。
-- [x] 在 `~/.bashrc` 里设置 Apptainer、HF 和其他缓存目录的环境变量（见"`~/.bashrc` 配置块"）；`cache/`、`stats/`、`results/`、`ckpt/` 还没建，见"目录布局"。
+- [x] 在 `~/.bashrc` 里设置 Apptainer、HF 和其他缓存目录的环境变量（见"`~/.bashrc` 配置块"）；`cache/`、`ckpt/` 还没建，`data/`、`stats/`、`results/` 改为放在仓库里，见"目录布局"。
 - [x] 验证 `--nv`、绑定挂载和 GPU 可见性：已用自建镜像的冒烟测试验证。
 - [x] 确认能用 fakeroot 构建：在 GPU 节点上 `apptainer build` 时 `%post` 自动在 fakeroot 下运行，不需要外部构建机。
 - [x] 写定义文件和锁文件，构建第一个镜像（一个镜像、两个 venv，没有拆成两个镜像）。
 - [x] 预下载 Qwen2.5-1.5B/7B-Instruct、Llama-3.2-1B、Llama-3.1-8B、GLP 权重和评测数据集（实际在 GPU 节点上用 `msm` 下载）。
 - [x] 容器内跑通冒烟测试，并在 4 卡节点上用 torchrun 跑通 5 步 LoRA 训练，通过 G0（单元测试随 `manifold_guard` 一起写）。
-- [ ] 写好扫描用的 sbatch 模板、作业数组模板和元数据记录，提交第一个作业：Qwen2.5-1.5B 的逐层统计。
+- [ ] 写好扫描用的 sbatch 模板、作业数组模板和元数据记录，提交第一个作业：Qwen2.5-1.5B 的逐层统计（`slurm/layer_stats.sbatch` 已写好，作业数组模板还没写）。
 
 ## 模块 1：逐层激活统计
 
 这个模块定义"自然流形"：在自然输入上逐层累计均值、协方差和特征分解，不存全部激活，只留一个小的随机样本用来校准阈值。它是所有打分器的基础，阶段 0 第一周完成。
 
-**数据。** 一半是 FineWeb 文本，一半是对话 prompt（如 UltraChat），回答由被测模型自己用 vLLM 生成，即 on-policy。prompt token 和 response token 分开统计，因为 steering 默认只作用在 response 位置。拟合集和校准集按文档切开，互不重叠。
+**数据。** 一半是 FineWeb 文本，一半是对话 prompt（UltraChat），回答由被测模型自己用 vLLM 生成，即 on-policy。具体做法（已实现）：
+
+- **语料**：FineWeb 取 `sample/10BT` 的第 1 个分片，UltraChat 取 `train_sft` 的第 1 个分片，用 `tools/download_assets.py --set corpus` 下载。
+- **生成回答**：`scripts/generate_onpolicy_chat.py` 让被测模型回答 UltraChat 的首轮问题，默认 25000 条。聊天格式与 weight-steering 的评测一致：只有一条 user 消息，不加 system prompt。采样参数用模型自带的 generation_config，并保存生成时的 token id，统计时不重新分词。
+- **三个角色分开统计**：text（FineWeb 的全部 token）、prompt（对话的 prompt 部分，含聊天模板）、response（模型自己的回答）。原计划只有 prompt 和 response 两个角色；FineWeb 单独作为 text，是为了不把纯文本和对话问题两种分布混在一起，需要时可以用 `merge` 合并。steering 默认只作用在 response 位置，所以 response 角色最重要。
+- **按文档切分**：文档按 id 的哈希固定分成三份。fit（90%）累计均值与协方差；calib（5%）进保留样本，用来校准阈值；holdout（5%）不读取，留给恒等性检查。
 
 **必须避开的三个坑：**
 
@@ -362,17 +383,35 @@ class Reservoir:
 
 **保留样本跨层对齐。** `Reservoir` 用 bottom-k 抽样：每行抽一个随机键，始终保留键最小的 k 行。seed 和分块方式相同时，各层保留的是同一批 token，可以逐行对上，M3 需要这一点（见 `test_reservoir_same_seed_selects_same_positions`）。作业数组里各任务的结果要合并时，各任务要用不同的 seed。
 
-**输出。** 每层一个文件 `stats/<model>/<role>/layer_XX.pt`，含 n、mean、cov、eigvals、eigvecs，再加每层 5 万条保留样本。7B 的统计量以 float32 存储，两个角色合计约 6 GB；保留样本每个角色约 10 GB。
+**输出。** 默认写在仓库里的 `stats/<模型名>/`（已加入 .gitignore），每个角色一个子目录：
+
+- 每层一个 `layer_XX.pt`：n、mean、cov、eigvals、eigvecs 和范数分位数，以 float32 存储。
+- 每层一个 `reservoir_XX.pt`：5 万条 calib 激活，以 float16 存储，各层逐行对齐。
+- 一个 `meta.json`：记录参数、各角色与切分的 token 数、镜像、git 哈希和作业号。
+
+三个角色合计，1.5B 约 15 GB，7B 约 40 GB，大部分是保留样本。on-policy 对话写在 `data/chat_onpolicy/<模型名>.jsonl`。
 
 **命令行：**
 
 ```
+# 一步提交（1 卡；对话文件已存在就跳过生成）
+sbatch slurm/layer_stats.sbatch Qwen/Qwen2.5-1.5B-Instruct
+sbatch -t 04:00:00 slurm/layer_stats.sbatch Qwen/Qwen2.5-7B-Instruct
+# 分开运行
+python scripts/generate_onpolicy_chat.py --model Qwen/Qwen2.5-7B-Instruct \
+  --out data/chat_onpolicy/Qwen2.5-7B-Instruct.jsonl
 python scripts/collect_layer_stats.py --model Qwen/Qwen2.5-7B-Instruct \
-  --mix fineweb:0.5,chat_onpolicy:0.5 --n_tokens 2e7 --layers all \
-  --roles prompt,response --reservoir 50000 --out stats/qwen7b
+  --chat data/chat_onpolicy/Qwen2.5-7B-Instruct.jsonl \
+  --n_tokens 2e7 --mix fineweb:0.5,chat:0.5 --reservoir 50000 --out stats/Qwen2.5-7B-Instruct
 ```
 
 **验收：** 单元测试里协方差与 numpy 结果的相对误差 < 1e-6；分块合并与一次算完结果一致；7B 跑 2000 万 token 在 GH200 上不超过 2 小时；每层的特征值谱已画图存档。
+
+**进展（2026-11-07）：**
+
+- 前两条已通过单元测试。端到端测试里，分 batch、带 padding 的统计结果与逐条、不 padding 前向的结果一致。
+- 1.5B 在合成文本上实测约 5.2 万 token/s（含 28 层统计），按此 2000 万 token 约 7 分钟。
+- 7B 的耗时和特征值谱还要等正式运行。
 
 ## 模块 2：离流形打分器
 
@@ -460,7 +499,7 @@ guard:
   gate_quantile: 0.99
   preserve_steering_direction: true
   positions: response
-  stats_dir: stats/qwen7b/response
+  stats_dir: stats/Qwen2.5-7B-Instruct/response
 ```
 
 **验收：** 阈值设成无穷大时 guard 的输出与不挂 guard 逐位相同；不加 steering 时 M2 满足恒等性判据；M0 在 Llama-3.1-8B-Instruct 的 persona 向量 steering 上复现出流畅度提升的方向。
