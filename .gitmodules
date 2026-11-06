@@ -1,0 +1,9 @@
+[submodule "third_party/generative_latent_prior"]
+	path = third_party/generative_latent_prior
+	url = https://github.com/g-luo/generative_latent_prior.git
+[submodule "third_party/weight-steering"]
+	path = third_party/weight-steering
+	url = https://github.com/safety-research/weight-steering.git
+[submodule "third_party/persona_vectors"]
+	path = third_party/persona_vectors
+	url = https://github.com/safety-research/persona_vectors.git
