@@ -8,12 +8,14 @@
 #   export APPTAINER_TMPDIR=/nobackup/proj/disk/naiss2025-22-1730/personal/licheng/apptainer_tmp
 #   apptainer build ms.sif manifold_steering.def
 #
-# 两个虚拟环境，用宿主机环境变量 MS_VENV 选择（默认 main）：
-#   main   vLLM + safety-tooling + GLP 依赖 + 调试工具
-#   train  torch + transformers + peft + trl（torch 与 main 保持同一版本）
+# 两个虚拟环境：
+#   main   vLLM + safety-tooling + GLP 依赖 + 调试工具（默认，已在 PATH 上）
+#   train  torch + transformers + peft + trl（用完整路径调用，torch 与 main 同版本）
 #
 #   apptainer exec --nv ms.sif python -c "import vllm"
-#   MS_VENV=train apptainer exec --nv ms.sif torchrun --nproc_per_node=4 train.py
+#   apptainer exec --nv ms.sif /opt/venvs/train/bin/torchrun --standalone --nproc_per_node=4 train.py
+#
+# 注意：不要用环境变量切换 venv，Apptainer 处理 %environment 时读不到宿主机上临时设置的变量。
 # =====================================================================
 Bootstrap: docker
 From: python:3.12-bookworm
@@ -27,9 +29,10 @@ From: python:3.12-bookworm
     export PYTHONUNBUFFERED=1
     export LANG=C.UTF-8
     export LC_ALL=C.UTF-8
-    export MS_VENV="${MS_VENV:-main}"
-    export VIRTUAL_ENV="/opt/venvs/${MS_VENV}"
-    export PATH="/opt/venvs/${MS_VENV}/bin:${PATH}"
+    export VIRTUAL_ENV=/opt/venvs/main
+    export PATH="/opt/venvs/main/bin:${PATH}"
+    # 镜像里没有 nvcc，FlashInfer 采样器会尝试现场编译而失败；改用 PyTorch 原生 top-k/top-p 采样
+    export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 
 %post -c /bin/bash
 set -euo pipefail
