@@ -22,7 +22,7 @@
 
 ## 当前进度与环境速查（2026-11-06）
 
-截至 2026-11-06，Arrhenius 上的容器环境已经建好，并通过了单卡与 4 卡测试；代码仓库已配置好 GitHub 的 SSH 认证。本节记录实际情况：下文原计划里的目录名、镜像名和 venv 切换方式如果与本节不一致，以本节为准。
+截至 2026-11-06，Arrhenius 上的容器环境已经建好，并通过了单卡与 4 卡测试；代码仓库已配置好 GitHub 的 SSH 认证；`smoke`、`qwen`、`llama`、`data` 四组模型和数据集已下载到 `$HF_HOME`（可选的 `refusal` 组未下载）。本节记录实际情况：下文原计划里的目录名、镜像名和 venv 切换方式如果与本节不一致，以本节为准。
 
 ### 已完成与待办
 
@@ -38,7 +38,7 @@
 - [x] 添加 third_party 子模块（weight-steering、generative_latent_prior、persona_vectors）
 - [x] 单卡冒烟测试全部通过（节点 n454，日志 `$PROJ/logs/smoke_gpu1_20261106-2308.log`）：vLLM 生成（需 `VLLM_USE_FLASHINFER_SAMPLER=0`）、HF 前向 hook（零向量逐字一致，4 倍范数随机向量使输出崩坏）、GLP 多层采样
 - [x] **G0 完成（2026-11-06）**
-- [ ] 在 HF 网页申请 Llama-3.2-1B / Llama-3.1-8B 许可，通过后下载 `llama` 组
+- [x] Llama-3.2-1B / Llama-3.1-8B 许可已通过，下载 `llama` 组（2026-11-06）：Llama-3.2-1B-Instruct 2.4 GB、Llama-3.1-8B-Instruct 15 GB、`glp-llama8b-d6` 13 GB
 - [ ] 阶段 0 MVP
 
 ### 路径与账号
@@ -126,22 +126,28 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
 
 ### 下一步
 
-1. 申请 Llama 许可，通过后在 GPU 节点上下载 `llama` 组（阶段 2 的 Llama 线才需要，不阻塞阶段 0）。
-2. 阶段 0 MVP（Qwen2.5-1.5B-Instruct）：`manifold_guard/layers.py`、`stats.py` 与逐层统计脚本，在自然语料上累计每层均值与协方差。
-3. 高斯与 PCA 打分器、阈值校准；用 weight-steering 的数据算 sycophancy 的激活 steering 向量与权重 steering 向量。
-4. 扫描 k，teacher-forcing 打分，画出"每层离流形分数 / 行为指标 / 能力指标"随 k 的曲线，判定 G1。
+1. 阶段 0 MVP（Qwen2.5-1.5B-Instruct）：`manifold_guard/layers.py`、`stats.py` 与逐层统计脚本，在自然语料上累计每层均值与协方差。
+2. 高斯与 PCA 打分器、阈值校准；用 weight-steering 的数据算 sycophancy 的激活 steering 向量与权重 steering 向量。
+3. 扫描 k，teacher-forcing 打分，画出"每层离流形分数 / 行为指标 / 能力指标"随 k 的曲线，判定 G1。
 
 ## 代码仓库结构
 
-新建一个顶层仓库，把三个上游仓库作为 fork 的 git submodule，自己的代码全部放在 `manifold_guard` 包里。上游只改两处入口：加参数、接 hook，其余当库调用。
+顶层仓库是 `Manifold_Steering_LLM`，三个上游仓库作为 git submodule 放在 `third_party/` 下，自己的代码全部放在 `manifold_guard` 包里。上游只改两处入口：加参数、接 hook，其余当库调用。目前三个 submodule 指向上游原仓库；开始改上游代码之前，先 fork 到自己的 GitHub，再把 submodule 地址换成 fork。
+
+截至 2026-11-06，仓库里已有 `containers/`、`docs/`、`slurm/`、`smoke/`、`tools/` 和 `third_party/`；`manifold_guard/`、`scripts/`、`configs/`、`tests/` 从阶段 0 开始逐步建立。
 
 ```
-manifold-steer/
+Manifold_Steering_LLM/
   third_party/
-    weight-steering/          # fork：LoRA 训练、task_vectors、vLLM 评测、Claude judge
-    generative_latent_prior/  # fork：GLP 权重加载、sample_on_manifold
+    weight-steering/          # LoRA 训练、task_vectors、vLLM 评测、Claude judge
+    generative_latent_prior/  # GLP 权重加载、sample_on_manifold
     persona_vectors/          # 为 Qwen 生成激活 steering 向量（.pt）
-  manifold_guard/             # 新包，pip install -e .
+  containers/                 # 镜像定义文件与锁文件（已有）
+  slurm/                      # sbatch 模板（已有：ddp_smoke.sbatch）
+  smoke/                      # 冒烟测试（已有）
+  tools/                      # 模型与数据集下载脚本（已有）
+  docs/                       # 本计划（已有）
+  manifold_guard/             # 新包；镜像只读，通过 PYTHONPATH 导入
     layers.py                 # 定位 model.layers、读写 hidden state（兼容 tuple 输出）
     stats.py                  # 流式均值/协方差，保存与加载
     scorers/                  # base.py, gauss.py, pca.py, glp.py
@@ -186,7 +192,7 @@ manifold-steer/
 用一个主环境跑全部代码：新版 torch（≥ 2.11，PyPI 上已有 CUDA aarch64 wheel）加最新 vLLM，不装 flash-attn 和 bitsandbytes。GLP 只当库导入，不沿用它锁死的 torch 2.7 / vllm 0.9.2。预计 1–3 天。在 Arrhenius 上，第 2–3 步改为在构建容器镜像时完成，见下一节。
 
 1. 确认硬件与驱动：`uname -m` 输出 `aarch64`，`nvidia-smi` 显示 GH200，驱动支持 CUDA 12.8 以上。HF 缓存目录 `HF_HOME` 放在本地 NVMe 上。
-2. 建主环境：`uv venv -p 3.11`，然后装 `torch>=2.11`、`vllm`、`transformers`、`datasets`、`peft`、`accelerate`、`axolotl`、`diffusers`、`einops`、`omegaconf`、`safetensors`、`scikit-learn`、`pytest`、`wandb`。
+2. 建主环境：`uv venv -p 3.11`，然后装 `torch>=2.11`、`vllm`、`transformers`、`datasets`、`peft`、`accelerate`、`trl`、`diffusers`、`einops`、`omegaconf`、`safetensors`、`scikit-learn`、`pytest`、`wandb`。（实际镜像用 Python 3.12，trl 和 peft 放在单独的 train 环境里，见"镜像与硬件实测"。）
 3. 装上游代码：clone `safety-research/safety-tooling` 并 `pip install -e`（weight-steering 依赖它）；GLP 用 `pip install -e third_party/generative_latent_prior --no-deps`，缺什么补什么。
 4. 设置密钥：`HF_TOKEN`（Llama 是 gated 模型）、`ANTHROPIC_API_KEY`（weight-steering 的 judge）、`OPENAI_API_KEY`（persona_vectors 生成向量时的过滤与打分）、可选 `WANDB_API_KEY`。
 5. 去掉硬编码路径：把 weight-steering 里所有 `/workspace/...` 换成配置项。
@@ -195,23 +201,23 @@ manifold-steer/
     2. vLLM 能加载 Qwen2.5-1.5B-Instruct 并生成。
     3. `steering_inference.py` 能在 HF 上挂 `ActivationSteerer` 生成。
     4. `load_glp("generative-latent-prior/glp-llama1b-d12-multi")` 能加载，并在第 7 层采样 64 条激活。
-    5. axolotl 能用改过的配置在 1 块卡上跑 10 步 LoRA，并在 4 块卡上以 DDP 跑通。
+    5. LoRA 训练（trl + peft）能在 1 块卡上跑 10 步，并在 4 块卡上以 DDP 跑通。
 
-每个 axolotl 配置都要做的改动（以 `qwen-2.5-1.5b (GCD)` 和 `qwen-2.5-7b` 目录为准）：
+实际做法（2026-11-06）：G0 没有逐条照搬上面五项，而是按下面四个测试验收：`smoke/gpu1_vllm.py`（vLLM 加载 Qwen2.5-0.5B-Instruct 生成）、`smoke/gpu2_hf_hook.py`（bf16 的 HF 前向 hook，代替第 3 项里的 `steering_inference.py`）、`smoke/gpu3_glp.py`（GLP 在第 0、7、15 层各采样 64 条）、`smoke/ddp_smoke.py`（4 卡上用随机初始化的小 Qwen2 跑 5 步 LoRA DDP，代替第 5 项）。`steering_inference.py` 留到改上游入口时再测。
 
-```yaml
-load_in_8bit: false            # 原为 true；96GB 显存不需要量化
-optimizer: adamw_torch_fused   # 原为 adamw_bnb_8bit；避开 ARM 上的 bitsandbytes
-flash_attention: false         # aarch64 没有上游 wheel
-sdp_attention: true
-dataset_prepared_path: ${DATA_ROOT}/axolotl-datasets/...   # 原为 /workspace/...
-output_dir: ${OUT_ROOT}/axolotl-outputs/...
-wandb_entity: <你自己的>
-```
+axolotl 在这个环境里装不上（见"踩过的坑"），LoRA 训练改用 trl + peft。超参仍从 weight-steering 的 axolotl 配置里读取（以 `qwen-2.5-1.5b (GCD)` 和 `qwen-2.5-7b` 目录为准），但下面几项要换成对应的写法：
+
+| axolotl 配置里的原值 | 在 trl + peft 里的做法 | 原因 |
+| --- | --- | --- |
+| `load_in_8bit: true` | 不量化，以 bf16 加载 | 96GB 显存不需要量化 |
+| `optimizer: adamw_bnb_8bit` | `optim="adamw_torch_fused"` | 避开 ARM 上的 bitsandbytes |
+| `flash_attention: true` | `attn_implementation="sdpa"` | aarch64 没有 flash-attn 的上游 wheel |
+| `dataset_prepared_path`、`output_dir` 指向 `/workspace/...` | 从配置读取 | 去掉硬编码路径 |
+| `wandb_entity` | 换成自己的 | — |
 
 改成 bf16 之后，训练数值会和论文略有不同。所以每个 LoRA 都按论文的做法，在 2–3 个学习率里按验证 loss 重新选一次。
 
-如果主环境装不顺，退路是 NGC 的 arm64 PyTorch 容器，在容器里再装 vLLM 和 axolotl。
+如果主环境装不顺，退路是 NGC 的 arm64 PyTorch 容器，在容器里再装 vLLM 和 trl。
 
 ## 在 Arrhenius 上用容器开发与运行
 
@@ -244,26 +250,29 @@ flowchart LR
 
 ### 目录布局
 
-以 BASE = `/nobackup/proj/disk/naiss2025-22-1730/personal/licheng` 为根，你已有的五个目录直接沿用，另建五个。
+以 BASE = `/nobackup/proj/disk/naiss2025-22-1730/personal/licheng`（即 `$PROJ`）为根。下表是 2026-11-06 的实际情况。
 
-| 目录 | 用途 | 对应环境变量 |
-| --- | --- | --- |
-| `containers/` | SIF 镜像，按"名称_日期_git 短哈希"命名，从不覆盖；定义文件与锁文件同时进 git | — |
-| `apptainer_cache/` | Apptainer 拉取与构建缓存 | APPTAINER_CACHEDIR |
-| `apptainer_tmp/` | 构建临时目录；构建太慢时改用节点本地 /tmp | APPTAINER_TMPDIR |
-| `hf_home/` | HF token 与配置 | HF_HOME |
-| `hf_cache/` | 模型与数据集缓存 | HF_HUB_CACHE、HF_DATASETS_CACHE |
-| `code/manifold-steer/`（新建） | 主仓库与三个 submodule | PYTHONPATH |
-| `envs/`（新建） | 镜像之上的薄包目录，只放迭代频繁、还没进镜像的包 | PYTHONPATH |
-| `cache/`（新建） | pip、Triton、TorchInductor 的持久缓存 | PIP_CACHE_DIR、TRITON_CACHE_DIR、TORCHINDUCTOR_CACHE_DIR |
-| `stats/`、`results/`、`ckpt/`（新建） | 逐层统计、实验结果、LoRA 检查点 | — |
-| `logs/`（新建） | Slurm 标准输出与错误输出 | — |
+| 目录 | 用途 | 对应环境变量 | 状态 |
+| --- | --- | --- | --- |
+| `containers/` | SIF 镜像，按"名称_日期"命名（如 `manifold_steering_20261106.sif`，附 `.sha256`），从不覆盖；`manifold_steering_current.sif` 指向当前在用的镜像；定义文件与锁文件进 git | — | 已有 |
+| `apptainer_cache/` | Apptainer 拉取与构建缓存 | APPTAINER_CACHEDIR | 已有 |
+| `apptainer_tmp/` | 构建临时目录；构建太慢时改用节点本地 /tmp | APPTAINER_TMPDIR | 已有 |
+| `hf_cache/` | HF token 与模型、数据集缓存（模型在 `hub/` 下） | HF_HOME | 已有 |
+| `Manifold_Steering_LLM/` | 代码仓库与三个 submodule | REPO | 已有 |
+| `logs/` | Slurm 标准输出与错误输出、冒烟测试日志 | — | 已有 |
+| `torch_cache/` | torch 的下载缓存 | TORCH_HOME | 尚未创建，首次使用时自动创建 |
+| `cache/` | pip、Triton、TorchInductor 的持久缓存 | PIP_CACHE_DIR、TRITON_CACHE_DIR、TORCHINDUCTOR_CACHE_DIR | 待建 |
+| `stats/`、`results/`、`ckpt/` | 逐层统计、实验结果、LoRA 检查点 | — | 待建 |
+
+原计划里的 `hf_home/`（与 `hf_cache/` 分开存 token）和 `envs/`（镜像之上的薄包目录）已经建好，但没有使用，目前都是空目录；`code/manifold-steer/` 改成了 `Manifold_Steering_LLM/`。
 
 API key（Anthropic、OpenAI、HF、wandb）放在 `$HOME` 下权限为 600 的文件里，由启动脚本读入环境变量。不放项目目录（同项目成员可能可读），不进镜像，不写进日志。
 
 ### 镜像设计
 
-- **一个还是两个镜像。** 先尝试一个镜像。如果 vLLM 锁定的 torch 版本和其他包冲突，就拆成 `ms-core`（torch、transformers、peft、accelerate、axolotl、diffusers、GLP 与 safety-tooling 的依赖、测试工具）和 `ms-vllm`（vLLM 及其锁定的 torch）。拆开不影响流水线，因为 weight-steering 本来就通过子进程和文件衔接生成与评测。
+实际采用的方案（2026-11-06）：一个镜像，基于 `python:3.12-bookworm`，用 uv 建 main 和 train 两个 venv，两者的 torch 版本相同；锁文件是两个 venv 的 `pip freeze` 结果，存在 `containers/lock-20261106/`；在 GPU 节点的交互会话里直接 `apptainer build`，`%post` 自动在 fakeroot 下运行，不需要外部构建机；代码不进镜像，脚本通过 `sys.path` 或 PYTHONPATH 导入 `third_party/` 下的仓库。下面是最初的设计考虑。
+
+- **一个还是两个镜像。** 先尝试一个镜像。如果 vLLM 锁定的 torch 版本和其他包冲突，就拆成 `ms-core`（torch、transformers、peft、accelerate、trl、diffusers、GLP 与 safety-tooling 的依赖、测试工具）和 `ms-vllm`（vLLM 及其锁定的 torch）。拆开不影响流水线，因为 weight-steering 本来就通过子进程和文件衔接生成与评测。
 - **基础镜像。** 首选 NVIDIA CUDA 的 arm64 运行时镜像，再用 uv 按锁文件安装 PyPI wheel，可复现性最好。备选是站点在用的 NGC PyTorch arm64 镜像，先用它验证 `--nv`、绑定挂载和 GPU 可见性。
 - **版本锁。** pyproject 与 uv 锁文件进 git。每个结果目录记录镜像名、git 哈希、Slurm 作业号和完整配置。
 - **代码不进镜像。** SIF 是只读的，不能做 editable 安装，所以用 PYTHONPATH 指向 `code/` 下的各个仓库和 `envs/`。改代码不需要重建镜像，只有依赖变化才重建。
@@ -272,12 +281,12 @@ API key（Anthropic、OpenAI、HF、wandb）放在 `$HOME` 下权限为 600 的�
 
 ### 开发与运行循环
 
-1. **登录节点**（SSH 或 ThinLinc）：编辑代码、git、把模型和数据集预下载到 `hf_cache/`、提交作业。不在登录节点上跑 GPU 代码或 aarch64 镜像。
+1. **登录节点**（SSH 或 ThinLinc）：编辑代码、git、提交作业。不在登录节点上跑 GPU 代码或 aarch64 镜像。模型和数据集在 GPU 节点的交互会话里用 `msm python tools/download_assets.py --set ...` 下载到 `hf_cache/`。
 2. **交互开发**：用 `interactive` 申请 1 块 GPU、2–4 小时，进入 `apptainer shell --nv` 并绑定 BASE。每次先跑单元测试和冒烟测试，再调试；需要 notebook 时用 SSH 隧道连 Jupyter。
 3. **批处理**：每类作业一个 sbatch 模板（构建镜像、逐层统计、LoRA 训练、扫描、打分、guard 生成）。统一由一个启动包装脚本设置环境变量、绑定路径、记录元数据。
 4. **并行扫描**：k 和系数扫描用 Slurm 作业数组，每个数组任务 1 块 GPU、处理一个取值。
 5. **judge 与 GPU 作业解耦**：GPU 作业只生成和打分（`--skip_judge_eval`）；judge 单独作为一个轻量步骤运行，不让 GPU 空等 batch API。
-6. **离线运行**：批处理作业设 `HF_HUB_OFFLINE=1`，只读预下载的缓存；wandb 用离线模式，事后在登录节点同步。计算节点能否出网要在第一次会话里确认；已有项目在 Arrhenius 的 GPU 节点上直接下载依赖（[Resist-VG](https://github.com/jiahuigeng/Resist-VG)），说明大概率可以。
+6. **离线运行**：批处理作业设 `HF_HUB_OFFLINE=1`，只读预下载的缓存；wandb 用离线模式，事后在登录节点同步。已确认 GPU 节点可以出网：镜像构建时的 pip 安装和模型下载都在 GPU 节点上完成。
 
 每个 sbatch 模板只属于下面三种资源配置之一：调试用 1 块卡，训练用整节点 4 块卡，扫描与评测用 1 卡作业数组。
 
@@ -291,20 +300,23 @@ API key（Anthropic、OpenAI、HF、wandb）放在 `$HOME` 下权限为 600 的�
 
 ### 对原计划的调整
 
-- **G0** 改为：镜像在 GPU 节点上构建完成，并在容器内通过 5 个冒烟测试、全部单元测试和 4 卡 DDP 训练冒烟测试。含镜像迭代，预计 2–4 天。
+- **G0** 改为：镜像在 GPU 节点上构建完成，并在容器内通过 5 个冒烟测试、全部单元测试和 4 卡 DDP 训练冒烟测试。含镜像迭代，预计 2–4 天。2026-11-06 通过；实际验收内容是 3 项单卡冒烟测试（vLLM 生成、HF 前向 hook、GLP 多层采样）和 4 卡 LoRA DDP 冒烟测试。单元测试测的是 `manifold_guard`，随阶段 0 的代码一起写。
 - **GPU 时间预算**：实验矩阵合计约 15 个 GPU 日，约 360 GPU 小时；开发与重跑按翻倍估算，约 700 GPU 小时。训练作业占整节点，每墙钟小时计 4 GPU 小时，总量基本不变，只是完成得更快。先用 `projinfo` 查项目的月度配额。
 - **日历时间**：有了每节点 4 块 GPU 和作业数组，阶段 1 和阶段 3 的瓶颈从 GPU 变成 judge 等待和人力。
 
 ### 上手清单（G0 之前）
 
-- [ ] 登录后确认：登录节点的架构、`projinfo` 里的账户与配额、项目目录的空间与文件数配额、计算节点能否出网。
-- [ ] 在 `~/.bashrc` 里设置 Apptainer、HF 和其他缓存目录的环境变量，并建好新目录。
-- [ ] 在交互 GPU 会话里试跑站点提供的 NGC PyTorch 镜像，验证 `--nv`、绑定挂载和 GPU 可见性。
-- [ ] 确认能否用 `--fakeroot` 构建；不行就准备外部 arm64 构建机和镜像仓库。
-- [ ] 写定义文件和锁文件，构建第一个镜像（必要时拆成两个）。
-- [ ] 在登录节点预下载 Qwen2.5-1.5B/7B-Instruct、Llama-3.2-1B、Llama-3.1-8B、GLP 权重和评测数据集。
-- [ ] 容器内跑通 5 个冒烟测试和单元测试，并在 4 卡节点上用 torchrun 跑通 2 步 LoRA 训练，通过 G0。
-- [ ] 写好 sbatch 模板、作业数组模板和元数据记录，提交第一个作业：Qwen2.5-1.5B 的逐层统计。
+2026-11-06 G0 通过时的完成情况：
+
+- [x] 确认登录节点是 x86_64、GPU 节点是 aarch64；GPU 节点可以出网。
+- [ ] 用 `projinfo` 和配额命令确认账户与配额、项目目录的空间与文件数配额。
+- [x] 在 `~/.bashrc` 里设置 Apptainer、HF 和其他缓存目录的环境变量（见"`~/.bashrc` 配置块"）；`cache/`、`stats/`、`results/`、`ckpt/` 还没建，见"目录布局"。
+- [x] 验证 `--nv`、绑定挂载和 GPU 可见性：已用自建镜像的冒烟测试验证。
+- [x] 确认能用 fakeroot 构建：在 GPU 节点上 `apptainer build` 时 `%post` 自动在 fakeroot 下运行，不需要外部构建机。
+- [x] 写定义文件和锁文件，构建第一个镜像（一个镜像、两个 venv，没有拆成两个镜像）。
+- [x] 预下载 Qwen2.5-1.5B/7B-Instruct、Llama-3.2-1B、Llama-3.1-8B、GLP 权重和评测数据集（实际在 GPU 节点上用 `msm` 下载）。
+- [x] 容器内跑通冒烟测试，并在 4 卡节点上用 torchrun 跑通 5 步 LoRA 训练，通过 G0（单元测试随 `manifold_guard` 一起写）。
+- [ ] 写好扫描用的 sbatch 模板、作业数组模板和元数据记录，提交第一个作业：Qwen2.5-1.5B 的逐层统计。
 
 ## 模块 1：逐层激活统计
 
@@ -523,7 +535,7 @@ class FlowTransition(TransitionPrior):
 
 ## 模块 6：训练时流形正则 M4
 
-M4 把约束从推理时挪到训练时：任务微调时加一项惩罚，让微调后模型的激活不越出原模型的自然分布，看能否直接减少论文里的"行为漂移"。用自己写的小训练脚本，不改 axolotl 内部；LoRA 超参与论文一致。
+M4 把约束从推理时挪到训练时：任务微调时加一项惩罚，让微调后模型的激活不越出原模型的自然分布，看能否直接减少论文里的"行为漂移"。用自己写的小训练脚本（peft + Trainer），不用 axolotl；LoRA 超参与论文一致。
 
 ```python
 # manifold_guard/reg.py
