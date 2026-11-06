@@ -179,7 +179,7 @@ rm -rf "$UV_CACHE_DIR" /root/.cache
 %runscript
     exec "${@:-bash}"
 
-%test -c /bin/bash
+%test
     set -e
     for v in main train; do
         /opt/venvs/$v/bin/python -c "import torch; assert torch.version.cuda; print('$v ok', torch.__version__)"
