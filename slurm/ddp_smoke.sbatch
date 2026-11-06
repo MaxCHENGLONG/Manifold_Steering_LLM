@@ -5,7 +5,7 @@
 #SBATCH -p gpu
 #SBATCH -N 1
 #SBATCH --gpus-per-node=4
-#SBATCH --exclusive
+##SBATCH --exclusive
 #SBATCH -t 00:20:00
 #SBATCH -J ddp-smoke
 #SBATCH -o /nobackup/proj/disk/naiss2025-22-1730/personal/licheng/logs/%x_%j.out
