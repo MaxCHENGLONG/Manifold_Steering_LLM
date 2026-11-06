@@ -38,6 +38,7 @@
 - [x] 添加 third_party 子模块（weight-steering、generative_latent_prior、persona_vectors）
 - [x] 单卡冒烟测试全部通过（节点 n454，日志 `$PROJ/logs/smoke_gpu1_20261106-2308.log`）：vLLM 生成（需 `VLLM_USE_FLASHINFER_SAMPLER=0`）、HF 前向 hook（零向量逐字一致，4 倍范数随机向量使输出崩坏）、GLP 多层采样
 - [x] **G0 完成（2026-11-06）**
+- [x] `manifold_guard/layers.py`、`stats.py` 及单元测试（`tests/`，在 CPU 上几秒跑完）（2026-11-06）
 - [x] Llama-3.2-1B / Llama-3.1-8B 许可已通过，下载 `llama` 组（2026-11-06）：Llama-3.2-1B-Instruct 2.4 GB、Llama-3.1-8B-Instruct 15 GB、`glp-llama8b-d6` 13 GB
 - [ ] 阶段 0 MVP
 
@@ -126,7 +127,7 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
 
 ### 下一步
 
-1. 阶段 0 MVP（Qwen2.5-1.5B-Instruct）：`manifold_guard/layers.py`、`stats.py` 与逐层统计脚本，在自然语料上累计每层均值与协方差。
+1. 阶段 0 MVP（Qwen2.5-1.5B-Instruct）：`manifold_guard/layers.py`、`stats.py` 已完成；接下来写逐层统计脚本，在自然语料上累计每层均值与协方差。
 2. 高斯与 PCA 打分器、阈值校准；用 weight-steering 的数据算 sycophancy 的激活 steering 向量与权重 steering 向量。
 3. 扫描 k，teacher-forcing 打分，画出"每层离流形分数 / 行为指标 / 能力指标"随 k 的曲线，判定 G1。
 
@@ -328,30 +329,38 @@ API key（Anthropic、OpenAI、HF、wandb）放在 `$HOME` 下权限为 600 的�
 
 - 去掉每个序列的首 token：attention sink 位置的范数比其他位置大几个数量级，会把协方差带偏。
 - 用 attention mask 去掉 padding token。
-- 用 forward hook 挂在 `model.layers[i]` 上取输出，不用 `output_hidden_states`：HF 返回的最后一项已经过 final norm，和 steerer 挂的位置不一致。层号约定与 persona 向量保持一致：`vector[l]` 对应 `model.layers[l-1]` 的输出。
+- 用 forward hook 挂在 `model.layers[i]` 上取输出，不用 `output_hidden_states`：HF 返回的最后一项已经过 final norm，和 steerer 挂的位置不一致。层号约定：本包的层号 l 就是 `model.layers[l]` 的输出，和 `ActivationSteerer.layer_idx` 一致；persona 向量的第 0 行是 embedding 层，所以 `vector[l]` 对应本包的第 l-1 层。
 
-**接口：**
+**接口（已实现）：**
 
 ```python
 # manifold_guard/layers.py
+def locate_layer(model, layer_idx): ...       # 直接调用 ActivationSteerer._locate_layer，与 steerer 挂在同一个模块上
 class LayerTap:
     """上下文管理器：在指定层挂 forward hook，缓存输出（兼容 tuple）。"""
-    def __init__(self, model, layers: list[int], positions: str = "all"): ...
-    outputs: dict[int, torch.Tensor]          # layer -> (B, T, d)
+    def __init__(self, model, layers="all", positions="all", detach=True): ...
+    outputs: dict[int, torch.Tensor]          # layer -> (B, T, d)；positions="last" 时为 (B, 1, d)
+def token_mask(attention_mask, drop_first=True): ...               # 去掉 padding 与首 token
+def role_masks(attention_mask, prompt_lens, drop_first=True): ...  # {"prompt": ..., "response": ...}
 
 # manifold_guard/stats.py
 class StreamingMoments:
-    def __init__(self, d: int, device="cuda"): ...
+    def __init__(self, d, device="cuda", norm_sample=100_000, chunk_rows=16_384, seed=0): ...
     def update(self, x: torch.Tensor) -> None: ...      # x: (N, d)，已去掉 pad 与首 token
     def merge(self, other: "StreamingMoments") -> None: ...
-    def finalize(self) -> dict: ...  # n, mean, cov, eigvals, eigvecs, norm 分位数
+    def finalize(self) -> dict: ...  # n, mean, cov, eigvals（从大到小）, eigvecs, norm 分位数
+    def state_dict(self) -> dict: ...                   # 与 from_state_dict 配合，作业数组各任务的结果事后合并
 
 class Reservoir:
     """每层保留固定数量的随机激活（float16），用于校准与 kNN。"""
-    def __init__(self, k: int, d: int): ...
+    def __init__(self, k, d, device="cuda", dtype=torch.float16, seed=0): ...
 ```
 
-**数值做法。** 每个 chunk 先在 float32 里算 chunk 内均值和中心化散度矩阵，再用 Chan 合并公式累加到 float64。最后在 GPU 上用 float64 的 `torch.linalg.eigh` 做特征分解。
+`LayerTap` 的 `positions` 目前只支持 `all` 和 `last`：阶段 0 只需要这两种，prompt 和 response 用 `role_masks` 来分。
+
+**数值做法。** 每个 chunk 先算 chunk 内均值和中心化散度矩阵，再用 Chan 合并公式并入总量，全程 float64（原计划是块内 float32、合并时 float64）。GH200 上 FP64 矩阵乘和不开 TF32 的 FP32 一样快，全程 float64 还不受全局 TF32 设置影响。最后在 GPU 上用 float64 的 `torch.linalg.eigh` 做特征分解。实测 d=3584 时，每 16384 个 token 的一次更新约 11 ms，2000 万 token × 28 层的统计部分约 7 分钟（不含模型前向）；GPU 与 CPU 结果的相对误差为 2e-16。
+
+**保留样本跨层对齐。** `Reservoir` 用 bottom-k 抽样：每行抽一个随机键，始终保留键最小的 k 行。seed 和分块方式相同时，各层保留的是同一批 token，可以逐行对上，M3 需要这一点（见 `test_reservoir_same_seed_selects_same_positions`）。作业数组里各任务的结果要合并时，各任务要用不同的 seed。
 
 **输出。** 每层一个文件 `stats/<model>/<role>/layer_XX.pt`，含 n、mean、cov、eigvals、eigvecs，再加每层 5 万条保留样本。7B 的统计量以 float32 存储，两个角色合计约 6 GB；保留样本每个角色约 10 GB。
 
@@ -628,8 +637,8 @@ M4 与 M3 的后半段重叠：M3 的 flow 模型训练时，人力转去写 M4�
 
 单元测试全部用一个随机初始化的小 Llama 配置在 CPU 上跑，几秒内完成；每次改动 `manifold_guard` 都必须先过这一套。
 
-- [ ] `test_stats`：`StreamingMoments` 与 numpy 的均值和协方差一致；分块合并与一次算完一致。
-- [ ] `test_layertap`：hook 取到的输出等于 HF `hidden_states[l+1]`（最后一层除外）；能处理 tuple 输出。
+- [x] `test_stats`：`StreamingMoments` 与 numpy 的均值和协方差一致；分块合并与一次算完一致。
+- [x] `test_layertap`：hook 取到的输出等于 HF `hidden_states[l+1]`（最后一层除外）；能处理 tuple 输出。
 - [ ] `test_guard_identity`：阈值为无穷大时，贪心生成结果与不挂 guard 逐 token 相同。
 - [ ] `test_hook_order`：同一层先注册 steerer、后注册 guard，guard 看到的是 steering 之后的值。
 - [ ] `test_positions`：`response` 模式在 prefill 时只改最后一个 prompt token，在 decode 时只改新 token。
