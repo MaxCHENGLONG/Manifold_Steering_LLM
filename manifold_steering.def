@@ -8,12 +8,14 @@
 #   export APPTAINER_TMPDIR=/nobackup/proj/disk/naiss2025-22-1730/personal/licheng/apptainer_tmp
 #   apptainer build ms.sif manifold_steering.def
 #
-# 两个虚拟环境，用宿主机环境变量 MS_VENV 选择（默认 main）：
-#   main   vLLM + safety-tooling + GLP 依赖 + 调试工具
-#   train  torch + transformers + peft + trl（+ axolotl，若能装上）
+# 两个虚拟环境：
+#   main   vLLM + safety-tooling + GLP 依赖 + 调试工具（默认，已在 PATH 上）
+#   train  torch + transformers + peft + trl（用完整路径调用，torch 与 main 同版本）
 #
 #   apptainer exec --nv ms.sif python -c "import vllm"
-#   MS_VENV=train apptainer exec --nv ms.sif torchrun --nproc_per_node=4 train.py
+#   apptainer exec --nv ms.sif /opt/venvs/train/bin/torchrun --standalone --nproc_per_node=4 train.py
+#
+# 注意：不要用环境变量切换 venv，Apptainer 处理 %environment 时读不到宿主机上临时设置的变量。
 # =====================================================================
 Bootstrap: docker
 From: python:3.12-bookworm
@@ -27,9 +29,8 @@ From: python:3.12-bookworm
     export PYTHONUNBUFFERED=1
     export LANG=C.UTF-8
     export LC_ALL=C.UTF-8
-    export MS_VENV="${MS_VENV:-main}"
-    export VIRTUAL_ENV="/opt/venvs/${MS_VENV}"
-    export PATH="/opt/venvs/${MS_VENV}/bin:${PATH}"
+    export VIRTUAL_ENV=/opt/venvs/main
+    export PATH="/opt/venvs/main/bin:${PATH}"
 
 %post -c /bin/bash
 set -euo pipefail
@@ -80,13 +81,11 @@ EOF
 
 # safety-tooling 的 InferenceAPI 导入时会加载所有供应商模块，这些包都要装上（不钉版本）。
 cat > "$REQ/safetytooling-deps.in" <<'EOF'
-together
 elevenlabs
 google-cloud-aiplatform
 google-cloud-run
 google-cloud-storage
 google-cloud-logging
-google-generativeai
 google-api-python-client
 grayswan-api
 langchain
@@ -109,6 +108,8 @@ GitPython
 ipywidgets
 websockets
 psutil
+tabulate
+eval-type-backport<0.3
 EOF
 
 cat > "$REQ/train.in" <<'EOF'
@@ -150,18 +151,20 @@ if ! uv pip install --python "$M" -r "$REQ/safetytooling-deps.in" -c /tmp/main-p
       || echo "skipped: $pkg" | tee -a "$OUT/main-fallback.txt"
   done < "$REQ/safetytooling-deps.in"
 fi
+# 以下两类包必须用 safety-tooling 写代码时的旧版本，但它们的旧依赖和 vLLM 的环境冲突，
+# 所以不带依赖安装（导入所需的依赖已在上面装好）：
+#   google-generativeai 0.8.4：已停止维护，其 generativelanguage 0.6.15 要求 protobuf<6
+#   together 1.5.4：新版 SDK 删除了 safety-tooling 导入的 together.error.ServiceUnavailableError
+uv pip install --python "$M" --no-deps \
+  "google-generativeai==0.8.4" "google-ai-generativelanguage==0.6.15" "together==1.5.4"
 
 # ---------- 3. train 环境 ----------
+# torch/torchvision 与 main 用同一版本：和驱动精确匹配，镜像打包时两份相同文件也会自动去重。
+# 不装 axolotl：它的每个版本都把 torch/datasets 钉成和这里冲突的具体版本；LoRA 训练改用 trl + peft。
 uv venv --python "$PY" /opt/venvs/train
 T=/opt/venvs/train/bin/python
-uv pip install --python "$T" -r "$REQ/train.in" -c "$REQ/constraints.txt"
-# axolotl 可选：不允许它改动已装的 torch/transformers 等；失败不影响构建。
-uv pip freeze --python "$T" | grep -iE '^(torch|torchvision|transformers|accelerate|peft|datasets)==' > /tmp/train-pins.txt || true
-if uv pip install --python "$T" axolotl -c /tmp/train-pins.txt -c "$REQ/constraints.txt"; then
-  echo "axolotl: installed" > "$OUT/optional-status.txt"
-else
-  echo "axolotl: FAILED" > "$OUT/optional-status.txt"
-fi
+uv pip freeze --python "$M" | grep -iE '^(torch|torchvision)==' > /tmp/main-torch.txt
+uv pip install --python "$T" -r "$REQ/train.in" -c "$REQ/constraints.txt" -c /tmp/main-torch.txt
 
 # ---------- 4. 记录版本、校验、清理 ----------
 uv pip freeze --python "$M" > "$OUT/requirements-main.lock.txt"
@@ -171,8 +174,8 @@ for v in main train; do
 done
 "$M" -c "import vllm; print('vllm', vllm.__version__)"
 "$M" -c "from safetytooling.apis import InferenceAPI" 2>"$OUT/safetytooling-import.err" \
-  && echo "safetytooling: ok" >> "$OUT/optional-status.txt" \
-  || echo "safetytooling: import FAILED" >> "$OUT/optional-status.txt"
+  && echo "safetytooling: ok" > "$OUT/optional-status.txt" \
+  || echo "safetytooling: import FAILED" > "$OUT/optional-status.txt"
 date -u +%Y-%m-%dT%H:%M:%SZ > "$OUT/built-at.txt"
 rm -rf "$UV_CACHE_DIR" /root/.cache
 
