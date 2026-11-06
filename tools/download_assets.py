@@ -6,6 +6,7 @@
   python3 tools/download_assets.py --set smoke
   python3 tools/download_assets.py --set qwen data
   python3 tools/download_assets.py --set llama          # 需先在 HF 网页上同意 Llama 许可并登录
+  python3 tools/download_assets.py --set corpus         # 逐层统计用的自然语料
   python3 tools/download_assets.py --list-cfierro       # 列出 cfierro 名下的全部数据集
 
 可以重复运行：已下载的文件会被跳过，只补缺的部分。
@@ -58,6 +59,11 @@ SETS = {
         # 分布内 evil 评测问题（persona vectors 的测试问题，论文 G.4）
         (DATASET, "cfierro/persona-vectors-eval-questions", None),
     ],
+    # 逐层统计的自然语料（模块 1）：FineWeb 纯文本，和 UltraChat 的首轮问题（回答由被测模型自己生成）
+    "corpus": [
+        (DATASET, "HuggingFaceFW/fineweb", None),
+        (DATASET, "HuggingFaceH4/ultrachat_200k", None),
+    ],
     # 拒答实验（论文 4.3 节，本计划中为可选）；weight-steering 代码读取的是 cfierro 的 chat 版本
     "refusal": [
         (DATASET, "cfierro/DirectHarm4-chat", None),
@@ -66,6 +72,13 @@ SETS = {
         (DATASET, "cfierro/safety-tuning-chat", None),
         (DATASET, "cfierro/alignment_faking_harm_answers_chat", None),
     ],
+}
+
+# 只下载仓库里的部分文件：FineWeb 取 sample/10BT 的 1 个分片（2.15 GB，远超 1000 万 token 的需要），
+# UltraChat 取 train_sft 的第 1 个分片（0.24 GB，约 7 万条对话）
+ALLOW = {
+    "HuggingFaceFW/fineweb": ["sample/10BT/000_00000.parquet"],
+    "HuggingFaceH4/ultrachat_200k": ["data/train_sft-00000-of-00003-*.parquet"],
 }
 
 
@@ -110,7 +123,8 @@ def main():
             t0 = time.time()
             try:
                 path = snapshot_download(
-                    repo_id=repo, repo_type=kind, ignore_patterns=ignore, max_workers=args.workers
+                    repo_id=repo, repo_type=kind, ignore_patterns=ignore, allow_patterns=ALLOW.get(repo),
+                    max_workers=args.workers,
                 )
                 print(f"[OK]   {repo:<62} {dir_size_gb(path):6.1f} GB  {time.time() - t0:5.0f} s")
             except Exception as e:  # noqa: BLE001  逐个记录失败，不中断其余下载

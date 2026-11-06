@@ -5,3 +5,6 @@ results/
 logs/
 wandb/
 .pytest_cache/
+.pytest_tmp/
+data/
+stats/
