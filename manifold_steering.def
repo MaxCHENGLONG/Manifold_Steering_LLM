@@ -1,0 +1,187 @@
+# =====================================================================
+# manifold_steering.def —— manifold-steer 项目镜像（aarch64 / GH200，Arrhenius）
+#
+# 自包含：不依赖任何外部文件，一条命令即可构建。
+# 必须在 GPU 节点（aarch64）上构建，登录节点是 x86_64，构建出来架构不对。
+#
+#   export APPTAINER_CACHEDIR=/nobackup/proj/disk/naiss2025-22-1730/personal/licheng/apptainer_cache
+#   export APPTAINER_TMPDIR=/nobackup/proj/disk/naiss2025-22-1730/personal/licheng/apptainer_tmp
+#   apptainer build ms.sif manifold_steering.def
+#
+# 两个虚拟环境，用宿主机环境变量 MS_VENV 选择（默认 main）：
+#   main   vLLM + safety-tooling + GLP 依赖 + 调试工具
+#   train  torch + transformers + peft + trl（+ axolotl，若能装上）
+#
+#   apptainer exec --nv ms.sif python -c "import vllm"
+#   MS_VENV=train apptainer exec --nv ms.sif torchrun --nproc_per_node=4 train.py
+# =====================================================================
+Bootstrap: docker
+From: python:3.12-bookworm
+
+%labels
+    title manifold-steer
+    arch aarch64-gh200
+
+%environment
+    export PYTHONNOUSERSITE=1
+    export PYTHONUNBUFFERED=1
+    export LANG=C.UTF-8
+    export LC_ALL=C.UTF-8
+    export MS_VENV="${MS_VENV:-main}"
+    export VIRTUAL_ENV="/opt/venvs/${MS_VENV}"
+    export PATH="/opt/venvs/${MS_VENV}/bin:${PATH}"
+
+%post -c /bin/bash
+set -euo pipefail
+
+# ---------- 0. 基本设置 ----------
+[[ "$(uname -m)" == "aarch64" ]] || { echo "必须在 aarch64（GH200）节点上构建"; exit 1; }
+PY=/usr/local/bin/python3.12
+REQ=/opt/ms/req
+OUT=/opt/ms/lock-out
+mkdir -p "$REQ" "$OUT" /opt/venvs
+export UV_CACHE_DIR=/opt/uv-cache UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy UV_HTTP_TIMEOUT=600 UV_NO_PROGRESS=1
+"$PY" -m pip install --no-cache-dir --root-user-action=ignore --upgrade pip uv
+
+# ---------- 1. 依赖清单 ----------
+# aarch64 上只有 torch>=2.11 的 PyPI wheel 自带 CUDA；更老的版本是纯 CPU 版。
+cat > "$REQ/constraints.txt" <<'EOF'
+torch>=2.11
+EOF
+
+cat > "$REQ/main-core.in" <<'EOF'
+vllm
+transformers
+datasets
+peft
+accelerate
+huggingface_hub
+safetensors
+diffusers
+omegaconf
+einops
+joblib
+numpy
+scipy
+scikit-learn
+pandas
+pyarrow
+matplotlib
+baukit @ git+https://github.com/davidbau/baukit.git
+anthropic
+openai
+wandb
+pytest
+ipython
+ipdb
+debugpy
+jupyterlab
+EOF
+
+# safety-tooling 的 InferenceAPI 导入时会加载所有供应商模块，这些包都要装上（不钉版本）。
+cat > "$REQ/safetytooling-deps.in" <<'EOF'
+together
+elevenlabs
+google-cloud-aiplatform
+google-cloud-run
+google-cloud-storage
+google-cloud-logging
+google-generativeai
+google-api-python-client
+grayswan-api
+langchain
+tiktoken
+jsonlines
+tenacity
+termcolor
+simple-parsing
+python-dotenv
+redis
+pydantic
+Jinja2
+plotly
+seaborn
+pydub
+soundfile
+librosa
+opencv-python-headless
+GitPython
+ipywidgets
+websockets
+psutil
+EOF
+
+cat > "$REQ/train.in" <<'EOF'
+torch>=2.11
+transformers
+peft
+accelerate
+datasets
+trl
+safetensors
+diffusers
+omegaconf
+einops
+joblib
+numpy
+scipy
+scikit-learn
+pandas
+pyarrow
+baukit @ git+https://github.com/davidbau/baukit.git
+wandb
+pytest
+ipython
+ipdb
+EOF
+
+# ---------- 2. main 环境 ----------
+# safety-tooling 把依赖钉在旧版本，直接和 vLLM 一起解析会冲突，所以分三步。
+uv venv --python "$PY" /opt/venvs/main
+M=/opt/venvs/main/bin/python
+uv pip install --python "$M" -r "$REQ/main-core.in" -c "$REQ/constraints.txt"
+uv pip freeze --python "$M" | grep -v ' @ ' > /tmp/main-pins.txt
+uv pip install --python "$M" --no-deps "safetytooling @ git+https://github.com/safety-research/safety-tooling.git"
+if ! uv pip install --python "$M" -r "$REQ/safetytooling-deps.in" -c /tmp/main-pins.txt -c "$REQ/constraints.txt"; then
+  echo "safety-tooling 依赖整体安装失败，逐个安装" | tee "$OUT/main-fallback.txt"
+  while read -r pkg; do
+    [[ -z "$pkg" ]] && continue
+    uv pip install --python "$M" "$pkg" -c /tmp/main-pins.txt -c "$REQ/constraints.txt" \
+      || echo "skipped: $pkg" | tee -a "$OUT/main-fallback.txt"
+  done < "$REQ/safetytooling-deps.in"
+fi
+
+# ---------- 3. train 环境 ----------
+uv venv --python "$PY" /opt/venvs/train
+T=/opt/venvs/train/bin/python
+uv pip install --python "$T" -r "$REQ/train.in" -c "$REQ/constraints.txt"
+# axolotl 可选：不允许它改动已装的 torch/transformers 等；失败不影响构建。
+uv pip freeze --python "$T" | grep -iE '^(torch|torchvision|transformers|accelerate|peft|datasets)==' > /tmp/train-pins.txt || true
+if uv pip install --python "$T" axolotl -c /tmp/train-pins.txt -c "$REQ/constraints.txt"; then
+  echo "axolotl: installed" > "$OUT/optional-status.txt"
+else
+  echo "axolotl: FAILED" > "$OUT/optional-status.txt"
+fi
+
+# ---------- 4. 记录版本、校验、清理 ----------
+uv pip freeze --python "$M" > "$OUT/requirements-main.lock.txt"
+uv pip freeze --python "$T" > "$OUT/requirements-train.lock.txt"
+for v in main train; do
+  /opt/venvs/$v/bin/python -c "import torch, sys; assert torch.version.cuda, 'CPU-only torch in $v'; print('$v: python', sys.version.split()[0], 'torch', torch.__version__, 'cuda', torch.version.cuda)"
+done
+"$M" -c "import vllm; print('vllm', vllm.__version__)"
+"$M" -c "from safetytooling.apis import InferenceAPI" 2>"$OUT/safetytooling-import.err" \
+  && echo "safetytooling: ok" >> "$OUT/optional-status.txt" \
+  || echo "safetytooling: import FAILED" >> "$OUT/optional-status.txt"
+date -u +%Y-%m-%dT%H:%M:%SZ > "$OUT/built-at.txt"
+rm -rf "$UV_CACHE_DIR" /root/.cache
+
+%runscript
+    exec "${@:-bash}"
+
+%test -c /bin/bash
+    set -e
+    for v in main train; do
+        /opt/venvs/$v/bin/python -c "import torch; assert torch.version.cuda; print('$v ok', torch.__version__)"
+    done
+    cat /opt/ms/lock-out/optional-status.txt
