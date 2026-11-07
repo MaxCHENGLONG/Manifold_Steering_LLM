@@ -19,19 +19,29 @@ def score_batched(scorer, x, layer, batch=8192):
 
 
 def calibrate(scorer, reservoir_dir, layers=None, qs=QS) -> dict:
-    """返回 {"scorer", "qs", "layers": {层: {n, median, iqr, quantiles, z_quantiles}}}，分位数键为字符串。"""
+    """返回 {"scorer", "qs", "layers": {层: {n, median, iqr, quantiles, z_quantiles}}, "trajectory"}，
+    分位数键为字符串。
+
+    各层保留样本逐行对齐（同一批 token，见 stats.Reservoir），所以还能在同一批 token 上算轨迹分数
+    （各层 z 的最大值、平均值）的分位数，存在 "trajectory": {"max": {...}, "mean": {...}}。
+    """
     layers = scorer.layers if layers is None else layers
     out = {"scorer": scorer.name, "qs": list(qs), "layers": {}}
+    z = {}
     for l in layers:
         s = score_batched(scorer, load_reservoir(reservoir_dir, l), l).double()
-        q25, med, q75, *rest = torch.quantile(s, torch.tensor([0.25, 0.5, 0.75, *qs], dtype=s.dtype)).tolist()
-        iqr = q75 - q25
-        out["layers"][l] = {
-            "n": len(s), "median": med, "iqr": iqr,
-            "quantiles": {str(q): v for q, v in zip(qs, rest)},
-            "z_quantiles": {str(q): (v - med) / iqr for q, v in zip(qs, rest)},
-        }
+        out["layers"][l] = _summary(s, qs)
+        z[l] = standardize(s, out, l)
+        out["layers"][l]["z_quantiles"] = {str(q): (v - out["layers"][l]["median"]) / out["layers"][l]["iqr"]
+                                           for q, v in zip(qs, out["layers"][l]["quantiles"].values())}
+    if len({len(v) for v in z.values()}) == 1:
+        out["trajectory"] = {agg: _summary(trajectory_score(z, agg), qs) for agg in ("max", "mean")}
     return out
+
+
+def _summary(s, qs):
+    q25, med, q75, *rest = torch.quantile(s, torch.tensor([0.25, 0.5, 0.75, *qs], dtype=s.dtype)).tolist()
+    return {"n": len(s), "median": med, "iqr": q75 - q25, "quantiles": {str(q): v for q, v in zip(qs, rest)}}
 
 
 def standardize(s, calib, layer):

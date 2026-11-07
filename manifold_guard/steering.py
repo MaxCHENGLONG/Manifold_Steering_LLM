@@ -106,9 +106,22 @@ def greedy_config(model, max_new_tokens):
     return cfg
 
 
+def sampling_config(model, max_new_tokens, temperature=1.0, top_p=1.0):
+    """采样解码，与上游 steering_inference.py 相同：只改 temperature、top_p 和长度，
+    top_k、repetition_penalty 沿用模型的 generation_config（Qwen2.5 为 20 和 1.1）。"""
+    cfg = copy.deepcopy(model.generation_config)
+    cfg.do_sample, cfg.temperature, cfg.top_p = True, temperature, top_p
+    cfg.max_new_tokens = max_new_tokens
+    return cfg
+
+
 @torch.no_grad()
-def generate(model, tok, conversations, gen_config, batch_size):
-    """左侧 padding 批量生成，返回每条的 (回答文本, 新 token 数)。"""
+def generate(model, tok, conversations, gen_config, batch_size, return_ids=False):
+    """左侧 padding 批量生成，返回每条的 (回答文本, 新 token 数)。
+
+    return_ids=True 时再附上 prompt 和回答的 token id（去掉 padding；回答含结束符，没写完则不含），
+    供 teacher forcing 原样喂回模型，不必重新分词。
+    """
     tok.padding_side = "left"
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -120,7 +133,10 @@ def generate(model, tok, conversations, gen_config, batch_size):
         enc = enc.to(model.device)
         ids = model.generate(**enc, generation_config=gen_config)
         new = ids[:, enc["input_ids"].shape[1]:]
-        for row in new:
-            n = int((row != tok.pad_token_id).sum())
-            out.append((tok.decode(row, skip_special_tokens=True), n))
+        for j, row in enumerate(new):
+            keep = row != tok.pad_token_id
+            item = (tok.decode(row, skip_special_tokens=True), int(keep.sum()))
+            if return_ids:
+                item += (enc["input_ids"][j][enc["attention_mask"][j].bool()].tolist(), row[keep].tolist())
+            out.append(item)
     return out

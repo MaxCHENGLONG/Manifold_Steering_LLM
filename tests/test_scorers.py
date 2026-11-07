@@ -92,6 +92,8 @@ def test_calibrate_standardizes_and_roundtrips(stats_dir, tmp_path):
         assert q50 == pytest.approx(0, abs=1e-6) and q75 - q25 == pytest.approx(1, abs=1e-6)
         zq = list(calib["layers"][l]["z_quantiles"].values())
         assert zq == sorted(zq) and zq[0] > 0
+        # 各层 z 取最大值后，分位数不会低于任何一层自己的分位数
+        assert calib["trajectory"]["max"]["quantiles"]["0.99"] >= calib["layers"][l]["z_quantiles"]["0.99"]
     save_calibration(calib, tmp_path / "c.json")
     assert load_calibration(tmp_path / "c.json") == calib
 
