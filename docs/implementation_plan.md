@@ -211,7 +211,7 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
   | τ⁺（谄媚） | 1.6523 | 1.6072 | **1.6044** |
   | τ⁻（不谄媚） | 1.4353 | **1.4333** | 1.4358 |
 
-  选中加粗的两个。τ⁻ 的验证 loss 只从 1.44 降到 1.43，说明 D⁻ 的回答本来就接近原模型自己的说法，Δ 主要来自 τ⁺。Δ 有 197 个参数有变化，‖Δ‖ = 1.55（`ckpt/Qwen2.5-1.5B-Instruct/sycophancy/delta.pt`）。
+  选中加粗的两个。τ⁻ 的验证 loss 只从 1.44 降到 1.43，说明 D⁻ 的回答本来就接近原模型自己的说法，Δ 主要来自 τ⁺。Δ 有 197 个参数有变化，‖Δ‖ = 1.63（`ckpt/Qwen2.5-1.5B-Instruct/sycophancy/delta.pt`；`delta.json` 里记的 1.55 是 float32 在 CPU 上累加 2 亿个元素少算的，脚本已改成 float64）。其中 96% 的能量在共享的 embedding/lm_head 上：weight-steering 的配置把它们全量训练，LoRA 部分只占 4%。
 - **C1 已完成**（作业 4975342，35 个配置，约 85 分钟）。结果在 `results/Qwen2.5-1.5B-Instruct/coarse/`，图是 `capability.png`（`scripts/plot_coarse.py` 画）。基线准确率 0.53，100 道题的标准误约 0.05。
   - 三种方法都是"平台 + 断崖"：强度不大时准确率在基线附近，越过某一点后，一个粗扫步长内掉到 0.1 左右，回答写到 3000 token 上限。
   - 能力断崖所在的区间：
@@ -224,7 +224,13 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
 
   - 正方向确实在放大谄媚：权重 k=+5 的回答不再答题，只剩"Oh, how wonderful! Your wisdom shines so brightly!"一类的奉承并不断重复。崩坏之前回答先变短：k=+2 平均 15 token，第 17 层 c_rel=+0.25 只剩"Final Answer: X"（基线 43 token）。负方向则是回答先变长。
 - **不做细扫（2026-11-07 决定）**：粗扫已经定出三种方法各自的崩坏区间，够判断拐点的大致位置，不再为加密网格多跑。C2 和 D 都沿用粗扫的 35 个配置，按计划往下走：A2 打分器 → 在粗扫配置上做 teacher-forcing 打分 → judge 评测与 G1 分析。粗扫里 TinyMMLU 的回答已经存盘，打分时直接用，不重新生成。
-- **下一步**：A2 打分器（交互会话）。
+- **A2 已完成，但没过计划里的验收**（`scripts/validate_scorers.py`，交互会话 65 s；结果在 `results/Qwen2.5-1.5B-Instruct/scorers/`）。打分器为 norm、gauss（λ=0.01）、pca（90%/95%/99% 方差），都在 response 角色的 calib 保留样本上校准（`stats/Qwen2.5-1.5B-Instruct/response/calib/`）。
+  - **打分器本身没问题**。合成负样本上，gauss、pca 比 norm 灵敏得多：随机扰动长度为 0.25 倍中位范数时，pca:99% 的 AUROC 为 0.90，gauss 为 0.75，norm 为 0.50；打乱维度时 gauss、pca 为 1.00，norm 为 0.50。
+  - **激活 steering 看得见**（128 条 holdout 对话、48,874 个 response token，轨迹分数取各层 z 的最大值）。第 17 层在 c_rel=±1 时 AUROC ≥ 0.97，全层在 ±0.5 时 0.83–0.93（pca:99%）。c_rel=±0.5 时 TinyMMLU 准确率还在基线附近（0.48），AUROC 已经升到 0.74–0.85，分数先于能力动。但第 17 层上 norm 和 gauss、pca 一样好，"norm 明显更差"这一条没过：diff-mean 方向本身在高方差方向上，加上去主要表现为范数变化。
+  - **权重 steering 在自然文本上几乎看不见**：k=±30 时（TinyMMLU 准确率 0）最好的 AUROC 也只有 0.68–0.74，k=+5 时为 0.50。不是没加上：k=30 时各层 ‖Δh‖/‖h‖ 的中位数为 0.3–0.5，top-1 预测只有 31% 与原模型一致。也就是说，权重 steering 把每个 token 的状态挪到了"另一个自然的位置"，逐层逐 token 的边缘分布打分器看不出来。可能和 Δ 主要落在共享的 embedding/lm_head 上有关。
+  - 这说明 G1 对权重 steering 不能只看自然文本上的状态，要看 steering 后模型自己生成的文本（C2 的设计正是这样），必要时用跨层先验（M3）或 GLP。
+- **实现上的两处改动**：norm 打分器改为 |log(‖h‖/中位范数)|，两侧都算偏离（权重 steering 会让范数变小，单侧时 AUROC 会低于 0.5）；新增 `MaskedSteerer` 和 `steer_mask`，teacher forcing 时只在生成时会加 steering 的位置上加，单元测试确认与生成时每一步的 logits 一致。
+- **下一步**：C2，在粗扫的配置上生成谄媚子集的回答，并对生成的文本做 teacher-forcing 逐层打分。先写代码并冒烟测试，再给出作业计划。
 - **单元测试**：`test_weight_steering.py`（k=0 时与原模型逐位相同、退出后参数恢复、共享权重一起变）和 `test_steering.py`（与 select_steerer 的挂法一致、答案解析）。
 
 ## 代码仓库结构
@@ -253,10 +259,12 @@ Manifold_Steering_LLM/
     hfdata.py                 # 从 HF 缓存直接读数据集 parquet（离线可用）（已有）
     steering.py               # 激活 steering 的挂法、相对系数、TinyMMLU 解析、HF 生成（已有）
     weight_steering.py        # Δ = θ⁺ − θ⁻ 与 WeightSteerer（显存里加 kΔ，退出恢复）（已有）
-    scorers/                  # base.py, gauss.py, pca.py, glp.py
+    scorers/                  # base.py、norm.py、gauss.py、pca.py（已有）；glp.py
     correctors.py             # 投影/修正算子
     guard.py                  # ManifoldGuard 上下文管理器
-    calibrate.py              # 逐层分位数阈值
+    calibrate.py              # 逐层分位数阈值、标准化、轨迹分数（已有）
+    metrics.py                # AUROC（已有）
+    plotting.py               # 画图的公共样式（已有）
     trajectory/               # M3：data.py, model.py, train.py
     reg.py                    # M4：训练时正则 ManifoldPenalty
   scripts/                    # 每个实验一个入口脚本（已有：generate_onpolicy_chat.py、collect_layer_stats.py、
@@ -277,7 +285,9 @@ Manifold_Steering_LLM/
 | `manifold_guard/scorers/*.py` | 统一 `score(h, layer)` 接口：Mahalanobis、PCA 残差、GLP 损失 | GLP 的 `Normalizer`、`fm_prepare` | 0–2 | 250 |
 | `manifold_guard/correctors.py` | PCA 投影、高斯收缩、GLP SDEdit、score 小步修正 | GLP 的 `postprocess_on_manifold_wrapper` | 2 | 150 |
 | `manifold_guard/guard.py` | 全层 forward hook、门控、触发日志 | `ActivationSteererMultiple` | 2 | 200 |
-| `manifold_guard/calibrate.py` | 自然激活上的分数分位数 → 阈值 τ_l | 新写 | 0 | 80 |
+| `manifold_guard/calibrate.py` | 自然激活上的分数分位数 → 阈值 τ_l；标准化与轨迹分数 | 新写 | 0 | 80 |
+| `manifold_guard/metrics.py` | AUROC（GPU 上算平均秩，并列算一半） | 新写 | 0 | 20 |
+| `manifold_guard/plotting.py` | 画图的公共样式（参考色板、steering 强度横轴） | 新写 | 0 | 40 |
 | `manifold_guard/trajectory/` | 跨层条件先验 p(h_l \| h_{l-1}) 的数据、模型、训练 | GLP 的去噪器结构 | 2 后半 | 400 |
 | `manifold_guard/reg.py` | 训练时离流形惩罚 `ManifoldPenalty` | 新写 | 2 后半 | 80 |
 | `manifold_guard/corpus.py` | 语料读取、按文档哈希切成 fit/calib/holdout、按长度打包 | 新写 | 0 | 130 |
@@ -287,11 +297,11 @@ Manifold_Steering_LLM/
 | `scripts/train_lora.py` | trl + peft 训练 τ⁺/τ⁻（float32，共享 embedding 保持共享） | 超参取自 axolotl 配置 | 0 | 110 |
 | `scripts/make_weight_delta.py` | 按验证 loss 选学习率，float32 算 Δ = θ⁺ − θ⁻ | `task_vectors.py` 的公式 | 0 | 70 |
 | `manifold_guard/weight_steering.py` | Δ 的计算与 `WeightSteerer`（显存里加 kΔ，不落盘） | `task_vectors.py` 的公式 | 0 | 70 |
-| `manifold_guard/steering.py` | 激活 steering 的挂法（同 `select_steerer`）、相对系数、TinyMMLU 解析 | `select_steerer`、`ActivationSteerer` | 0 | 90 |
+| `manifold_guard/steering.py` | 激活 steering 的挂法（同 `select_steerer`）、teacher forcing 用的 `MaskedSteerer`、相对系数、TinyMMLU 解析 | `select_steerer`、`ActivationSteerer` | 0 | 140 |
 | `scripts/sweep_capability.py` | C1 粗扫：TinyMMLU 准确率随 k 的变化，可续跑 | 新写 | 0 | 150 |
 | `scripts/plot_coarse.py` | 画粗扫的能力曲线（每种方法一列），打印表格 | 新写 | 0 | 110 |
 | `scripts/compute_diffmean_vectors.py` | 从 D⁺/D⁻ 算激活 steering 向量（persona_vectors 格式） | 新写 | 0 | 100 |
-| `scripts/validate_scorers.py` | 打分器 AUROC 验证 | 新写 | 0–1 | 120 |
+| `scripts/validate_scorers.py` | 校准打分器；合成与真实 steering 负样本上的逐层、轨迹 AUROC | 新写 | 0–1 | 220 |
 | `scripts/sweep_weight_steering.py` | 循环 k：调 `task_vectors.py` → vLLM 生成 → judge | `inference_and_eval.py` | 0–1 | 150 |
 | `scripts/sweep_activation_steering.py` | 循环系数，可选挂 guard | `steering_inference.py` | 0–1 | 120 |
 | `scripts/score_teacher_forced.py` | 把生成文本喂回模型，逐层打分 | 新写 | 0–1 | 150 |
@@ -549,7 +559,7 @@ def trajectory_score(per_layer: dict[int, torch.Tensor], agg="max") -> torch.Ten
 
 | 打分器 | 定义 | 每 token 每层开销 | 适用模型 | 用途 |
 | --- | --- | --- | --- | --- |
-| 范数比 | ‖h‖ 除以自然样本的中位范数 | 可忽略 | 全部 | 基线，检查是不是只测到了范数 |
+| 范数比 | \|log(‖h‖ / 自然样本的中位范数)\|，范数偏大、偏小都算偏离 | 可忽略 | 全部 | 基线，检查是不是只测到了范数 |
 | 高斯（Mahalanobis） | 用收缩协方差 (1−λ)Σ + λ·(tr Σ / d)·I 白化后的平方距离，除以 d | 一次 d×d 矩阵乘 | 全部 | 门控主力 |
 | PCA 残差 | 去掉前 k 个主成分后的剩余能量，k 取解释 99% 方差的维数 | 一次 d×k 矩阵乘 | 全部 | 门控，与投影配套 |
 | GLP 损失 | 固定 u（如 0.3、0.5、0.7）、4 次噪声平均的 flow-matching 损失 | 约等于一次完整 LLM 前向，或更多 | 仅 Llama（1B 全层，8B 第 15 层） | 离线复核、M0 |
@@ -796,7 +806,7 @@ M4 与 M3 的后半段重叠：M3 的 flow 模型训练时，人力转去写 M4�
 - [ ] `test_guard_identity`：阈值为无穷大时，贪心生成结果与不挂 guard 逐 token 相同。
 - [ ] `test_hook_order`：同一层先注册 steerer、后注册 guard，guard 看到的是 steering 之后的值。
 - [ ] `test_positions`：`response` 模式在 prefill 时只改最后一个 prompt token，在 decode 时只改新 token。
-- [ ] `test_scorers`：在合成高斯数据上，马氏距离服从卡方分布；落在主子空间内的点 PCA 残差为 0。
+- [x] `test_scorers`：在合成高斯数据上，马氏距离服从卡方分布；落在主子空间内的点 PCA 残差为 0；校准后 z 的中位数为 0、四分位距为 1；AUROC 与 sklearn 一致。
 - [ ] `test_glp_wrapper`：u 趋近 0 时 `glp_sdedit` 的输出约等于输入。
 - [x] `test_task_vectors`：k=0 时合并模型的 logits 与原模型相同（见 `tests/test_weight_steering.py`）。
 - [ ] `test_diffmean`：有 persona_vectors 的 `.pt` 时，自算向量与它的余弦相似度 ≥ 0.99。
