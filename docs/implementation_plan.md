@@ -43,6 +43,8 @@
 - [x] 下载 `corpus` 组（FineWeb 与 UltraChat 各 1 个分片，约 2.4 GB）
 - [x] Qwen2.5-1.5B-Instruct 第一次逐层统计（2026-11-07，作业 4934828，节点 n92）：prompt、response 角色正常；text 角色第 1–25 层被 attention sink 污染（见"踩过的坑"），对话采样参数也与评测不一致。已修复，旧结果已删除
 - [x] 用新代码重跑 Qwen2.5-1.5B-Instruct 的逐层统计（2026-11-07，作业 4968664，节点 n45），`scripts/check_layer_stats.py` 全部通过，特征值谱存档在 `stats/Qwen2.5-1.5B-Instruct/spectra.png`
+- [x] 1.5B 实验：激活 steering 向量；LoRA 训练、Δ、粗扫三个脚本写好并通过冒烟测试（2026-11-07）
+- [ ] 提交 τ⁺/τ⁻ 训练作业数组与 C1 粗扫作业
 - [x] Llama-3.2-1B / Llama-3.1-8B 许可已通过，下载 `llama` 组（2026-11-06）：Llama-3.2-1B-Instruct 2.4 GB、Llama-3.1-8B-Instruct 15 GB、`glp-llama8b-d6` 13 GB
 - [ ] 阶段 0 MVP
 
@@ -90,6 +92,11 @@ cd $REPO && msm python -m pytest -q
 cd $REPO && sbatch slurm/layer_stats.sbatch Qwen/Qwen2.5-1.5B-Instruct
 # 检查逐层统计并画特征值谱（写出 check.json、spectra.png；有问题时退出码为 1）
 cd $REPO && msm python scripts/check_layer_stats.py stats/Qwen2.5-1.5B-Instruct
+# 训练 τ⁺/τ⁻（作业数组，6 个任务：2 个数据集 × 3 个学习率）
+cd $REPO && sbatch --array=0-5 slurm/train_lora.sbatch Qwen/Qwen2.5-1.5B-Instruct sycophancy \
+    cfierro/pv-prompts-sycophantic_Qwen2.5-1.5B-Instruct cfierro/pv-prompts-non-sycophantic_Qwen2.5-1.5B-Instruct
+# 粗扫（训练全部成功后自动开始）：结果在 $REPO/results/<模型名>/coarse/
+cd $REPO && sbatch --dependency=afterok:<训练作业号> slurm/sweep_coarse.sbatch Qwen/Qwen2.5-1.5B-Instruct sycophancy sycophantic
 # 4 卡批处理作业
 cd $REPO && sbatch slurm/ddp_smoke.sbatch
 # 查看作业与日志
@@ -137,6 +144,8 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
 | VS Code 终端里 `msm` 报 `apptainer: command not found`，也没有 `sbatch` | VS Code 服务本身跑在容器里，终端也在容器里 | 直接用 `/opt/venvs/main/bin/python`；下载、提交作业在登录节点或宿主机的 SSH 终端里做 |
 | 导入上游代码后，`third_party/weight-steering` 显示有改动 | Python 往 submodule 里写了 `__pycache__` | `manifold_guard/upstream.py` 导入上游模块时关闭字节码写入 |
 | Qwen 的 text 角色第 1–25 层最大特征值约 4700、参与比只有 1.4–2；约十万分之四的 token 范数是中位数的 200 倍以上 | Qwen 的 tokenizer 不加 BOS，FineWeb 文档以数字开头时，attention sink 落在第 1–4 个 token 上，去掉首 token 挡不住；这 0.004% 的 token 占了第 1–14 层 E‖x‖² 的 61%–70% | `iter_fineweb` 在文档前补 `model.config.bos_token_id`（Qwen 为 `<\|endoftext\|>`），实测大范数 token 降为 0；`check_layer_stats.py` 会报出这类 token |
+| LoRA 训练第 2 步起 grad_norm 为 NaN，之后 loss 变成 0 | bf16 autocast 加 sdpa 注意力，batch 里有 padding 时反向传播出 NaN；与 peft 设置、梯度检查点、优化器都无关（纯 float32、eager 注意力、batch 1 都正常） | `train_lora.py` 全程 float32 |
+| pytest 之后 `.pytest_tmp/` 里手动放的文件不见了 | `--basetemp` 每次运行前会清空该目录 | 冒烟测试的输出不要放在 `.pytest_tmp/` 里过夜 |
 | on-policy 回答的采样参数与评测不一致 | vLLM 默认用模型的 generation_config（Qwen2.5：temperature 0.7、top_p 0.8） | 生成脚本改用 weight-steering 评测的设置：temperature 1.0、top_p 1.0、最多 600 个新 token |
 
 ### 下一步
@@ -163,7 +172,11 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
 **本项目的决定：**
 
 - **共享的 embedding 保持共享。** 1.5B 的 `embed_tokens` 与 `lm_head` 共用权重（7B 不共用）。用 peft 的 `ensure_weight_tying=True` 只训一份。
-- **基座以 float32 加载、bf16 autocast 训练。** lr 1e-5 时，全量训练的 embedding 每步更新远小于 bf16 的分辨率，以 bf16 存参数会把更新舍掉。
+- **LoRA 全程 float32 训练，不用 bf16 autocast。** 理由有两个：
+  - lr 1e-5 时，全量训练的 embedding 每步更新远小于 bf16 的分辨率，参数以 bf16 存会把更新舍掉。
+  - bf16 autocast 加 sdpa 注意力在 batch 里有 padding 时，反向传播会出 NaN（见"踩过的坑"）。
+
+  数据很少，float32 下 100 步也只要 2–3 分钟。梯度检查点只省显存、不影响结果，1.5B 默认关闭。
 - **θ⁺ − θ⁻ 在 float32 里算一次存下来。** 扫描时在显存里给模型加上 kΔ，用完恢复，不为每个 k 落盘。原因有两个：合并后以 bf16 存的模型会把很小的 Δ 量化掉；每个 k 都存一份完整模型也太慢。
 - **激活 steering 向量**用同一份 D⁺/D⁻，在回答 token 上求均值差，格式与 persona 向量一致（第 0 行为 embedding 层）。
 - **激活系数用相对大小表示**：c_rel = c·‖v_l‖ / 该层 response 范数中位数，不同层之间可以直接比较。
@@ -175,12 +188,22 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
 
 | 步骤 | 内容 | 运行方式 | 估计耗时 |
 | --- | --- | --- | --- |
-| A1 | `compute_diffmean_vectors.py`：从 D⁺/D⁻ 算激活 steering 向量 | 交互会话 | 几分钟 |
-| B | `train_lora.py`（trl + peft）训练 τ⁺、τ⁻，lr 取 5e-6、1e-5、2e-5，按验证 loss 选；再算 Δ = θ⁺ − θ⁻ | 冒烟测试在交互会话，正式训练提交作业 | 约 30 分钟，1 卡 |
-| C1 | 粗扫，只测 TinyMMLU：权重 k ∈ {0, ±2, ±5, ±10, ±20, ±30}；第 17 层与全层激活 c_rel ∈ {0, ±0.25, ±0.5, ±1, ±2, ±4} | 提交作业 | 约 1 小时，1 卡 |
+| A1 | `compute_diffmean_vectors.py`：从 D⁺/D⁻ 算激活 steering 向量 | 交互会话 | 不到 1 分钟 |
+| B | `train_lora.py`（trl + peft）训练 τ⁺、τ⁻，lr 取 5e-6、1e-5、2e-5（`slurm/train_lora.sbatch`，作业数组）；`make_weight_delta.py` 按验证 loss 各选一个，算 Δ = θ⁺ − θ⁻ | 冒烟测试在交互会话，正式训练提交作业 | 每个 2–3 分钟，1 卡 |
+| C1 | 粗扫，只测 TinyMMLU（`sweep_capability.py`、`slurm/sweep_coarse.sbatch`）：权重 k ∈ {0, ±2, ±5, ±10, ±20, ±30}；第 17 层与全层激活 c_rel ∈ {0, ±0.05, ±0.1, ±0.25, ±0.5, ±1, ±2}（冒烟测试里 c_rel=1 已完全崩坏，所以从 0.05 起） | 提交作业 | 约 1 小时，1 卡 |
 | A2 | 打分器（norm、gauss、pca）、`calibrate.py`、`validate_scorers.py`（PCA 的 k 试 90%/95%/99% 方差三档） | 交互会话 | 几分钟 |
 | C2 | 细扫：在崩坏区间取约 9 个点 × 三种方法，在 500 条谄媚子集和 TinyMMLU 上生成并逐层打分，另做 k=0 基线和"原模型给 steering 后的文本打分"两个对照 | 作业数组 | 约 2 小时 GPU |
 | D | judge 评测（约 27 个配置 × 500 条）与分析，判定 G1 | judge 在登录节点 | 视接口速率而定 |
+
+**进展（2026-11-07）：**
+
+- **A1 已完成**：`data/vectors/Qwen2.5-1.5B-Instruct/sycophantic_response_avg_diff.pt`，形状 (29, 1536)。各行范数从第 1 行的 1.1 增到第 28 行的 27.2，第 17 行为 8.2；第 17 层 response 范数中位数约 60，所以 c_rel=1 对应绝对系数约 7.3。
+- **B 与 C1 的代码已完成并通过冒烟测试**：
+  - LoRA 训 10 步，两个适配器的验证 loss 都在下降，合并后共享的 embedding 仍是一份。
+  - Δ 覆盖 197 个参数（28 层 × 7 个线性层，外加 embedding）。
+  - 粗扫在 20 道题上跑通，基线准确率 0.60。
+- **下一步**：提交训练作业数组和粗扫作业。
+- **单元测试**：`test_weight_steering.py`（k=0 时与原模型逐位相同、退出后参数恢复、共享权重一起变）和 `test_steering.py`（与 select_steerer 的挂法一致、答案解析）。
 
 ## 代码仓库结构
 
@@ -205,13 +228,19 @@ Manifold_Steering_LLM/
     stats.py                  # 流式均值/协方差，保存与加载（已有）
     corpus.py                 # 逐层统计语料：读取、按文档切分、打包（已有）
     runinfo.py                # 结果目录里记录的运行环境（已有）
+    hfdata.py                 # 从 HF 缓存直接读数据集 parquet（离线可用）（已有）
+    steering.py               # 激活 steering 的挂法、相对系数、TinyMMLU 解析、HF 生成（已有）
+    weight_steering.py        # Δ = θ⁺ − θ⁻ 与 WeightSteerer（显存里加 kΔ，退出恢复）（已有）
     scorers/                  # base.py, gauss.py, pca.py, glp.py
     correctors.py             # 投影/修正算子
     guard.py                  # ManifoldGuard 上下文管理器
     calibrate.py              # 逐层分位数阈值
     trajectory/               # M3：data.py, model.py, train.py
     reg.py                    # M4：训练时正则 ManifoldPenalty
-  scripts/                    # 每个实验一个入口脚本（已有：generate_onpolicy_chat.py、collect_layer_stats.py、check_layer_stats.py）
+  scripts/                    # 每个实验一个入口脚本（已有：generate_onpolicy_chat.py、collect_layer_stats.py、
+                              #   check_layer_stats.py、compute_diffmean_vectors.py、train_lora.py、
+                              #   make_weight_delta.py、sweep_capability.py）
+  ckpt/                       # LoRA 适配器与 Δ（gitignore）
   configs/                    # omegaconf yaml：模型、层、打分器、阈值
   tests/                      # 单元测试（已有）
   data/                       # on-policy 对话（gitignore）
@@ -233,6 +262,11 @@ Manifold_Steering_LLM/
 | `scripts/generate_onpolicy_chat.py` | vLLM 生成 on-policy 对话，保存 token id | 新写 | 0 | 100 |
 | `scripts/collect_layer_stats.py` | 在语料上累计统计 | 新写 | 0 | 120 |
 | `scripts/check_layer_stats.py` | 检查逐层统计（计数、NaN、马氏距离、大范数 token），画特征值谱 | 新写 | 0 | 170 |
+| `scripts/train_lora.py` | trl + peft 训练 τ⁺/τ⁻（float32，共享 embedding 保持共享） | 超参取自 axolotl 配置 | 0 | 110 |
+| `scripts/make_weight_delta.py` | 按验证 loss 选学习率，float32 算 Δ = θ⁺ − θ⁻ | `task_vectors.py` 的公式 | 0 | 70 |
+| `manifold_guard/weight_steering.py` | Δ 的计算与 `WeightSteerer`（显存里加 kΔ，不落盘） | `task_vectors.py` 的公式 | 0 | 70 |
+| `manifold_guard/steering.py` | 激活 steering 的挂法（同 `select_steerer`）、相对系数、TinyMMLU 解析 | `select_steerer`、`ActivationSteerer` | 0 | 90 |
+| `scripts/sweep_capability.py` | C1 粗扫：TinyMMLU 准确率随 k 的变化，可续跑 | 新写 | 0 | 150 |
 | `scripts/compute_diffmean_vectors.py` | 从 D⁺/D⁻ 算激活 steering 向量（persona_vectors 格式） | 新写 | 0 | 100 |
 | `scripts/validate_scorers.py` | 打分器 AUROC 验证 | 新写 | 0–1 | 120 |
 | `scripts/sweep_weight_steering.py` | 循环 k：调 `task_vectors.py` → vLLM 生成 → judge | `inference_and_eval.py` | 0–1 | 150 |
@@ -741,7 +775,7 @@ M4 与 M3 的后半段重叠：M3 的 flow 模型训练时，人力转去写 M4�
 - [ ] `test_positions`：`response` 模式在 prefill 时只改最后一个 prompt token，在 decode 时只改新 token。
 - [ ] `test_scorers`：在合成高斯数据上，马氏距离服从卡方分布；落在主子空间内的点 PCA 残差为 0。
 - [ ] `test_glp_wrapper`：u 趋近 0 时 `glp_sdedit` 的输出约等于输入。
-- [ ] `test_task_vectors`：k=0 时合并模型的 logits 与原模型相同。
+- [x] `test_task_vectors`：k=0 时合并模型的 logits 与原模型相同（见 `tests/test_weight_steering.py`）。
 - [ ] `test_diffmean`：有 persona_vectors 的 `.pt` 时，自算向量与它的余弦相似度 ≥ 0.99。
 
 | 风险 | 早期信号 | 应对 |
