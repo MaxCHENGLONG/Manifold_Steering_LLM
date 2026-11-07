@@ -193,7 +193,7 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
 | B | `train_lora.py`（trl + peft）训练 τ⁺、τ⁻，lr 取 5e-6、1e-5、2e-5（`slurm/train_lora.sbatch`，作业数组）；`make_weight_delta.py` 按验证 loss 各选一个，算 Δ = θ⁺ − θ⁻ | 冒烟测试在交互会话，正式训练提交作业 | 每个 2–3 分钟，1 卡 |
 | C1 | 粗扫，只测 TinyMMLU（`sweep_capability.py`、`slurm/sweep_coarse.sbatch`）：权重 k ∈ {0, ±2, ±5, ±10, ±20, ±30}；第 17 层与全层激活 c_rel ∈ {0, ±0.05, ±0.1, ±0.25, ±0.5, ±1, ±2}（冒烟测试里 c_rel=1 已完全崩坏，所以从 0.05 起） | 提交作业 | 约 1 小时，1 卡 |
 | A2 | 打分器（norm、gauss、pca）、`calibrate.py`、`validate_scorers.py`（PCA 的 k 试 90%/95%/99% 方差三档） | 交互会话 | 几分钟 |
-| C2 | 沿用粗扫网格（不另做细扫）：在 500 条谄媚子集上生成，与粗扫已存的 TinyMMLU 回答一起逐层打分，另做 k=0 基线和"原模型给 steering 后的文本打分"两个对照 | 作业数组 | 约 2 小时 GPU |
+| C2 | 沿用粗扫网格（不另做细扫）：在 500 条谄媚子集上生成（`generate_steered.py`），与粗扫已存的 TinyMMLU 回答一起逐层打分（`score_teacher_forced.py`），另做 k=0 基线和"原模型给 steering 后的文本打分"两个对照（`slurm/c2_score.sbatch`） | 作业数组，按方法分 3 个任务 | 每个任务约 20 分钟，1 卡 |
 | D | judge 评测（粗扫的配置 × 500 条）与分析，判定 G1 | judge 在登录节点 | 视接口速率而定 |
 
 **进展（2026-11-07）：**
@@ -230,7 +230,14 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
   - **权重 steering 在自然文本上几乎看不见**：k=±30 时（TinyMMLU 准确率 0）最好的 AUROC 也只有 0.68–0.74，k=+5 时为 0.50。不是没加上：k=30 时各层 ‖Δh‖/‖h‖ 的中位数为 0.3–0.5，top-1 预测只有 31% 与原模型一致。也就是说，权重 steering 把每个 token 的状态挪到了"另一个自然的位置"，逐层逐 token 的边缘分布打分器看不出来。可能和 Δ 主要落在共享的 embedding/lm_head 上有关。
   - 这说明 G1 对权重 steering 不能只看自然文本上的状态，要看 steering 后模型自己生成的文本（C2 的设计正是这样），必要时用跨层先验（M3）或 GLP。
 - **实现上的两处改动**：norm 打分器改为 |log(‖h‖/中位范数)|，两侧都算偏离（权重 steering 会让范数变小，单侧时 AUROC 会低于 0.5）；新增 `MaskedSteerer` 和 `steer_mask`，teacher forcing 时只在生成时会加 steering 的位置上加，单元测试确认与生成时每一步的 logits 一致。
-- **下一步**：C2，在粗扫的配置上生成谄媚子集的回答，并对生成的文本做 teacher-forcing 逐层打分。先写代码并冒烟测试，再给出作业计划。
+- **C2 的代码已完成并通过冒烟测试**：
+  - **子集**：`cfierro/sycophancy_eval_answer` 的 test 切分每 4 行是同一个问题的 4 种提示（只有问题；"我不认为是正确答案"；"我认为是错误答案"；"我认为是正确答案"）。按问题整组抽 125 组 = 500 条，种子 0。
+  - **生成**（`scripts/generate_steered.py`）：与上游 `steering_inference.py` 一致，temperature 1.0、top_p 1.0、最多 600 个新 token，top_k 20 和 repetition_penalty 1.1 沿用模型的 generation_config。配置取自粗扫的 `summary.json`，每个配置的随机种子由种子和配置名决定。保存 prompt 与回答的 token id，以及 judge 需要的提示原文和正确答案（上游 judge 只看问题、回答和正确答案，判 CORRECT/INCORRECT）。
+  - **打分**（`scripts/score_teacher_forced.py`）：把"prompt + 回答"一次喂回模型，在两种条件下逐层打分。steered 是喂给生成它的那个模型（激活 steering 用 `MaskedSteerer`），base_model 是喂给原模型。每条回答、每层、每个打分器记录 z 的均值、最大值和超过 99% / 99.9% 分位数的比例；轨迹分数（各层 z 的最大值）记在 layer = −1。轨迹分数的阈值在 calib 保留样本上校准，各层保留样本逐行对齐，所以可以直接算。
+  - **TinyMMLU**：粗扫的回答没存 token id，只能按文本重新分词。正常回答的长度与生成时完全一致；崩坏的配置里有 2–6% 的回答会短最多约 120 个 token，原因是解码时去掉了回答中间生成的特殊 token。
+  - **用时**：每个配置生成 500 条约 45–65 s，打分约 15 s。3 个任务各约 20 分钟。
+  - **冒烟测试里已经看到的现象**（20 条）：权重 k=+5 的回答对错误答案大加附和（"Oh absolutely! That's precisely right… Absolutely brilliant!"），但被 steering 的模型读自己的回答时，轨迹分数超过 99% 分位数的 token 只有 0.6%。k=+10（500 条，TinyMMLU 准确率已是 0）时也只有 0.9%，与自然样本的 1% 相当。第 17 层激活 c_rel=+1 则相反：steered 条件下 100% 超过，原模型读同样的文本只有 0.9%，说明不自然的是 steering 后模型的内部计算，而不是文本本身。
+- **下一步**：提交 C2 作业：`sbatch --array=0-2 slurm/c2_score.sbatch Qwen/Qwen2.5-1.5B-Instruct sycophancy sycophantic`。跑完后写 judge 脚本（D）和分析。
 - **单元测试**：`test_weight_steering.py`（k=0 时与原模型逐位相同、退出后参数恢复、共享权重一起变）和 `test_steering.py`（与 select_steerer 的挂法一致、答案解析）。
 
 ## 代码仓库结构
@@ -246,7 +253,7 @@ Manifold_Steering_LLM/
     generative_latent_prior/  # GLP 权重加载、sample_on_manifold
     persona_vectors/          # 为 Qwen 生成激活 steering 向量（.pt）
   containers/                 # 镜像定义文件与锁文件（已有）
-  slurm/                      # sbatch 模板（已有：ddp_smoke、layer_stats、train_lora、sweep_coarse，以及共用的 one_gpu.sh）
+  slurm/                      # sbatch 模板（已有：ddp_smoke、layer_stats、train_lora、sweep_coarse、c2_score，以及共用的 one_gpu.sh）
   smoke/                      # 冒烟测试（已有）
   tools/                      # 模型与数据集下载脚本（已有）
   docs/                       # 本计划（已有）
@@ -269,7 +276,8 @@ Manifold_Steering_LLM/
     reg.py                    # M4：训练时正则 ManifoldPenalty
   scripts/                    # 每个实验一个入口脚本（已有：generate_onpolicy_chat.py、collect_layer_stats.py、
                               #   check_layer_stats.py、compute_diffmean_vectors.py、train_lora.py、
-                              #   make_weight_delta.py、sweep_capability.py）
+                              #   make_weight_delta.py、sweep_capability.py、plot_coarse.py、validate_scorers.py、
+                              #   generate_steered.py、score_teacher_forced.py）
   ckpt/                       # LoRA 适配器与 Δ（gitignore）
   configs/                    # omegaconf yaml：模型、层、打分器、阈值
   tests/                      # 单元测试（已有）
@@ -304,7 +312,8 @@ Manifold_Steering_LLM/
 | `scripts/validate_scorers.py` | 校准打分器；合成与真实 steering 负样本上的逐层、轨迹 AUROC | 新写 | 0–1 | 220 |
 | `scripts/sweep_weight_steering.py` | 循环 k：调 `task_vectors.py` → vLLM 生成 → judge | `inference_and_eval.py` | 0–1 | 150 |
 | `scripts/sweep_activation_steering.py` | 循环系数，可选挂 guard | `steering_inference.py` | 0–1 | 120 |
-| `scripts/score_teacher_forced.py` | 把生成文本喂回模型，逐层打分 | 新写 | 0–1 | 150 |
+| `scripts/generate_steered.py` | C2：粗扫的每个配置下在谄媚子集上采样生成，保存 token id | 新写 | 0 | 130 |
+| `scripts/score_teacher_forced.py` | 把生成文本喂回模型（steered 与 base_model 两种条件），逐层打分，按回答汇总成 parquet | 新写 | 0–1 | 190 |
 | `scripts/eval_identity.py` | 干净文本 CE loss 增量与触发率 | 新写 | 2 | 100 |
 | `scripts/train_with_manifold_reg.py` | peft + Trainer，loss = CE + λ · 惩罚 | 新写，超参取自 axolotl 配置 | 2 后半 | 150 |
 | `scripts/analyze_h1_h2.py` | 汇总、相关性、Pareto 图 | 新写 | 1 | 200 |
