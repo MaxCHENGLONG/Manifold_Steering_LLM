@@ -40,7 +40,9 @@
 - [x] **G0 完成（2026-11-06）**
 - [x] `manifold_guard/layers.py`、`stats.py` 及单元测试（`tests/`，在 CPU 上几秒跑完）（2026-11-06）
 - [x] 逐层统计代码（2026-11-07）：`manifold_guard/corpus.py`、`scripts/generate_onpolicy_chat.py`、`scripts/collect_layer_stats.py`、`slurm/layer_stats.sbatch`；在 Qwen2.5-1.5B-Instruct 上用 100 万 token 合成文本冒烟通过（约 5.2 万 token/s，含 28 层统计）
-- [ ] 下载 `corpus` 组（FineWeb 与 UltraChat 各 1 个分片，约 2.4 GB），提交 Qwen2.5-1.5B-Instruct 的逐层统计作业
+- [x] 下载 `corpus` 组（FineWeb 与 UltraChat 各 1 个分片，约 2.4 GB）
+- [x] Qwen2.5-1.5B-Instruct 第一次逐层统计（2026-11-07，作业 4934828，节点 n92）：prompt、response 角色正常；text 角色第 1–25 层被 attention sink 污染（见"踩过的坑"），对话采样参数也与评测不一致。已修复，旧结果已删除
+- [ ] 用新代码重跑 Qwen2.5-1.5B-Instruct 的逐层统计，并用 `scripts/check_layer_stats.py` 检查
 - [x] Llama-3.2-1B / Llama-3.1-8B 许可已通过，下载 `llama` 组（2026-11-06）：Llama-3.2-1B-Instruct 2.4 GB、Llama-3.1-8B-Instruct 15 GB、`glp-llama8b-d6` 13 GB
 - [ ] 阶段 0 MVP
 
@@ -86,6 +88,8 @@ mst torchrun --standalone --nproc_per_node=4 train.py
 cd $REPO && msm python -m pytest -q
 # 逐层统计（1 卡）：先生成 on-policy 对话，再逐层累计；结果在 $REPO/stats/<模型名>/
 cd $REPO && sbatch slurm/layer_stats.sbatch Qwen/Qwen2.5-1.5B-Instruct
+# 检查逐层统计并画特征值谱（写出 check.json、spectra.png；有问题时退出码为 1）
+cd $REPO && msm python scripts/check_layer_stats.py stats/Qwen2.5-1.5B-Instruct
 # 4 卡批处理作业
 cd $REPO && sbatch slurm/ddp_smoke.sbatch
 # 查看作业与日志
@@ -132,10 +136,12 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
 | scp 报 `dest open ... Failure` | 目标目录不存在 | 先 `ssh arrhenius "mkdir -p 目录"` 再上传 |
 | VS Code 终端里 `msm` 报 `apptainer: command not found`，也没有 `sbatch` | VS Code 服务本身跑在容器里，终端也在容器里 | 直接用 `/opt/venvs/main/bin/python`；下载、提交作业在登录节点或宿主机的 SSH 终端里做 |
 | 导入上游代码后，`third_party/weight-steering` 显示有改动 | Python 往 submodule 里写了 `__pycache__` | `manifold_guard/upstream.py` 导入上游模块时关闭字节码写入 |
+| Qwen 的 text 角色第 1–25 层最大特征值约 4700、参与比只有 1.4–2；约十万分之四的 token 范数是中位数的 200 倍以上 | Qwen 的 tokenizer 不加 BOS，FineWeb 文档以数字开头时，attention sink 落在第 1–4 个 token 上，去掉首 token 挡不住；这 0.004% 的 token 占了第 1–14 层 E‖x‖² 的 61%–70% | `iter_fineweb` 在文档前补 `model.config.bos_token_id`（Qwen 为 `<\|endoftext\|>`），实测大范数 token 降为 0；`check_layer_stats.py` 会报出这类 token |
+| on-policy 回答的采样参数与评测不一致 | vLLM 默认用模型的 generation_config（Qwen2.5：temperature 0.7、top_p 0.8） | 生成脚本改用 weight-steering 评测的设置：temperature 1.0、top_p 1.0、最多 600 个新 token |
 
 ### 下一步
 
-1. 阶段 0 MVP（Qwen2.5-1.5B-Instruct）：逐层统计代码已完成。在 GPU 节点上运行 `msm python tools/download_assets.py --set corpus` 下载语料，再提交 `sbatch slurm/layer_stats.sbatch Qwen/Qwen2.5-1.5B-Instruct`（估计 20–30 分钟，其中生成对话的耗时还没实测）；结果出来后画每层的特征值谱存档。
+1. 阶段 0 MVP（Qwen2.5-1.5B-Instruct）：用新代码重跑 `sbatch slurm/layer_stats.sbatch Qwen/Qwen2.5-1.5B-Instruct`（第一次实测：生成对话 8 分钟、统计 6 分钟），再运行 `scripts/check_layer_stats.py` 检查并画每层的特征值谱存档。
 2. 高斯与 PCA 打分器、阈值校准；用 weight-steering 的数据算 sycophancy 的激活 steering 向量与权重 steering 向量。
 3. 扫描 k，teacher-forcing 打分，画出"每层离流形分数 / 行为指标 / 能力指标"随 k 的曲线，判定 G1。
 
@@ -168,7 +174,7 @@ Manifold_Steering_LLM/
     calibrate.py              # 逐层分位数阈值
     trajectory/               # M3：data.py, model.py, train.py
     reg.py                    # M4：训练时正则 ManifoldPenalty
-  scripts/                    # 每个实验一个入口脚本（已有：generate_onpolicy_chat.py、collect_layer_stats.py）
+  scripts/                    # 每个实验一个入口脚本（已有：generate_onpolicy_chat.py、collect_layer_stats.py、check_layer_stats.py）
   configs/                    # omegaconf yaml：模型、层、打分器、阈值
   tests/                      # 单元测试（已有）
   data/                       # on-policy 对话（gitignore）
@@ -189,6 +195,7 @@ Manifold_Steering_LLM/
 | `manifold_guard/corpus.py` | 语料读取、按文档哈希切成 fit/calib/holdout、按长度打包 | 新写 | 0 | 130 |
 | `scripts/generate_onpolicy_chat.py` | vLLM 生成 on-policy 对话，保存 token id | 新写 | 0 | 100 |
 | `scripts/collect_layer_stats.py` | 在语料上累计统计 | 新写 | 0 | 120 |
+| `scripts/check_layer_stats.py` | 检查逐层统计（计数、NaN、马氏距离、大范数 token），画特征值谱 | 新写 | 0 | 170 |
 | `scripts/compute_diffmean_vectors.py` | 从 D⁺/D⁻ 算激活 steering 向量（persona_vectors 格式） | 新写 | 0 | 100 |
 | `scripts/validate_scorers.py` | 打分器 AUROC 验证 | 新写 | 0–1 | 120 |
 | `scripts/sweep_weight_steering.py` | 循环 k：调 `task_vectors.py` → vLLM 生成 → judge | `inference_and_eval.py` | 0–1 | 150 |
@@ -342,13 +349,19 @@ API key（Anthropic、OpenAI、HF、wandb）放在 `$HOME` 下权限为 600 的�
 **数据。** 一半是 FineWeb 文本，一半是对话 prompt（UltraChat），回答由被测模型自己用 vLLM 生成，即 on-policy。具体做法（已实现）：
 
 - **语料**：FineWeb 取 `sample/10BT` 的第 1 个分片，UltraChat 取 `train_sft` 的第 1 个分片，用 `tools/download_assets.py --set corpus` 下载。
-- **生成回答**：`scripts/generate_onpolicy_chat.py` 让被测模型回答 UltraChat 的首轮问题，默认 25000 条。聊天格式与 weight-steering 的评测一致：只有一条 user 消息，不加 system prompt。采样参数用模型自带的 generation_config，并保存生成时的 token id，统计时不重新分词。
+- **生成回答**：`scripts/generate_onpolicy_chat.py` 让被测模型回答 UltraChat 的首轮问题，默认 30000 条，保存生成时的 token id，统计时不重新分词。生成设置与 weight-steering 的评测（`inference_and_eval.py` 的默认值）一致：
+  - 只有一条 user 消息，不加 system prompt；
+  - temperature 1.0、top_p 1.0，最多 600 个新 token；
+  - top_k 和 repetition_penalty 两边都沿用模型的 generation_config（Qwen2.5：20 和 1.1）。
+
+  这样阈值校准用的回答和评测时的回答来自同一个采样分布。
 - **三个角色分开统计**：text（FineWeb 的全部 token）、prompt（对话的 prompt 部分，含聊天模板）、response（模型自己的回答）。原计划只有 prompt 和 response 两个角色；FineWeb 单独作为 text，是为了不把纯文本和对话问题两种分布混在一起，需要时可以用 `merge` 合并。steering 默认只作用在 response 位置，所以 response 角色最重要。
 - **按文档切分**：文档按 id 的哈希固定分成三份。fit（90%）累计均值与协方差；calib（5%）进保留样本，用来校准阈值；holdout（5%）不读取，留给恒等性检查。
 
-**必须避开的三个坑：**
+**必须避开的坑：**
 
 - 去掉每个序列的首 token：attention sink 位置的范数比其他位置大几个数量级，会把协方差带偏。
+- 保证首 token 就是 sink：tokenizer 不加 BOS 时（Qwen），纯文本前要补上 `model.config.bos_token_id`。否则文档以数字开头时，sink 会落到第 1–4 个 token 上，去掉首 token 也挡不住（第一次跑 1.5B 时 text 角色就是这样，见"踩过的坑"）。对话以 `<|im_start|>` 开头，不受影响。
 - 用 attention mask 去掉 padding token。
 - 用 forward hook 挂在 `model.layers[i]` 上取输出，不用 `output_hidden_states`：HF 返回的最后一项已经过 final norm，和 steerer 挂的位置不一致。层号约定：本包的层号 l 就是 `model.layers[l]` 的输出，和 `ActivationSteerer.layer_idx` 一致；persona 向量的第 0 行是 embedding 层，所以 `vector[l]` 对应本包的第 l-1 层。
 
@@ -388,6 +401,7 @@ class Reservoir:
 - 每层一个 `layer_XX.pt`：n、mean、cov、eigvals、eigvecs 和范数分位数，以 float32 存储。
 - 每层一个 `reservoir_XX.pt`：5 万条 calib 激活，以 float16 存储，各层逐行对齐。
 - 一个 `meta.json`：记录参数、各角色与切分的 token 数、镜像、git 哈希和作业号。
+- 运行 `scripts/check_layer_stats.py` 后另有 `check.json`（每层的检查结果、k99、参与比）和 `spectra.png`（特征值谱）。
 
 三个角色合计，1.5B 约 15 GB，7B 约 40 GB，大部分是保留样本。on-policy 对话写在 `data/chat_onpolicy/<模型名>.jsonl`。
 
@@ -411,6 +425,8 @@ python scripts/collect_layer_stats.py --model Qwen/Qwen2.5-7B-Instruct \
 
 - 前两条已通过单元测试。端到端测试里，分 batch、带 padding 的统计结果与逐条、不 padding 前向的结果一致。
 - 1.5B 在合成文本上实测约 5.2 万 token/s（含 28 层统计），按此 2000 万 token 约 7 分钟。
+- 1.5B 第一次正式运行（作业 4934828）：生成 25000 条对话用时 496 s，统计 2000 万 token 用时 347 s（约 6.3 万 token/s）。calib 样本在 fit 高斯下的马氏²/d 均值在 0.98–1.05 之间。prompt 和 response 正常，text 角色被 attention sink 污染，对话采样参数也与评测不一致。两处都已修复，旧结果已删除，等待重跑。
+- `scripts/check_layer_stats.py` 负责检查并画特征值谱（最后一条验收）。它会核对计数、查 NaN/Inf，检查 calib 的马氏²/d 是否在 0.9–1.1 之间、有没有范数超过中位数 10 倍的保留样本。
 - 7B 的耗时和特征值谱还要等正式运行。
 
 ## 模块 2：离流形打分器
