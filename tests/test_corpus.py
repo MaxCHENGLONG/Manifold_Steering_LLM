@@ -73,6 +73,16 @@ def test_iter_fineweb(tmp_path):
     assert all(s.source == "fineweb" and s.prompt_len == len(s.input_ids) for s in seqs)
 
 
+def test_iter_fineweb_prepends_bos(tmp_path):
+    path = tmp_path / "shard.parquet"
+    bos = ord("^")
+    pq.write_table(pa.table({"id": ["a", "b", "c"], "text": ["hello world", "^abc", ""]}), path)
+    seqs = list(iter_fineweb(path, _CharTokenizer(), max_len=5, bos_id=bos))
+    assert seqs[0].input_ids == [bos] + [ord(c) for c in "hell"]  # 补上 BOS 后仍不超过 max_len
+    assert seqs[1].input_ids == [ord(c) for c in "^abc"]           # 已经以 BOS 开头的不重复补
+    assert len(seqs) == 2                                           # 空文档补 BOS 后只有 1 个 token，跳过
+
+
 def test_iter_chat(tmp_path):
     path = tmp_path / "chat.jsonl"
     rows = [{"id": "p1", "prompt_token_ids": [1, 2, 3], "response_token_ids": [4, 5]},

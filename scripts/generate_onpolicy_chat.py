@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """用 vLLM 让被测模型回答 UltraChat 的首轮问题，生成逐层统计用的 on-policy 对话。
 
-聊天格式与 weight-steering 的评测一致：只放一条 user 消息，不加 system prompt
-（Qwen2.5 的模板会自动补上默认 system prompt）；采样参数用模型自带的 generation_config。
+生成设置与 weight-steering 的评测（inference_and_eval.py 的默认值）一致：只放一条 user 消息，
+不加 system prompt（Qwen2.5 的模板会自动补上默认 system prompt）；temperature 1.0、top_p 1.0、
+最多 600 个新 token；top_k、repetition_penalty 两边都沿用模型的 generation_config。
 输出 jsonl，每行一条：id、prompt、response、finish_reason、prompt_token_ids、response_token_ids。
 保存生成时的 token id，统计时直接使用，不重新分词。
 
@@ -41,9 +42,12 @@ def main():
     ap = argparse.ArgumentParser(description="生成 on-policy 对话")
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True, help="输出的 jsonl 路径")
-    ap.add_argument("--n_prompts", type=int, default=25_000)
+    ap.add_argument("--n_prompts", type=int, default=30_000)
     ap.add_argument("--max_prompt_tokens", type=int, default=1024, help="套上聊天模板后超过这个长度的问题跳过")
-    ap.add_argument("--max_new_tokens", type=int, default=1024)
+    # 以下三项的默认值与 weight-steering 的 inference_and_eval.py 一致
+    ap.add_argument("--max_new_tokens", type=int, default=600)
+    ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--top_p", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
@@ -68,8 +72,8 @@ def main():
                 break
     print(f"选出 {len(convs)} 个问题（目标 {args.n_prompts}）")
 
-    params = llm.get_default_sampling_params()
-    params.max_tokens = args.max_new_tokens
+    params = llm.get_default_sampling_params()  # 带上 generation_config 里的 top_k、repetition_penalty
+    params.temperature, params.top_p, params.max_tokens = args.temperature, args.top_p, args.max_new_tokens
     outputs = llm.chat(convs, params, use_tqdm=True)
 
     tmp = out.with_name(out.name + ".tmp")  # 写完再改名，作业中断时不会留下半个文件

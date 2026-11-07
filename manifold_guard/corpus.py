@@ -41,12 +41,20 @@ class Sequence:
         self.split = split_of(self.source, self.doc_id)
 
 
-def iter_fineweb(path, tokenizer, max_len):
-    """逐条读取 FineWeb 分片（parquet），分词后截断到 max_len。"""
+def iter_fineweb(path, tokenizer, max_len, bos_id=None):
+    """逐条读取 FineWeb 分片（parquet），分词后截断到 max_len。
+
+    bos_id 不为 None 且分词结果不以它开头时，在最前面补上（传 model.config.bos_token_id）。
+    Qwen 的 tokenizer 不加 BOS：文档以数字开头时，attention sink 会落到第 1–4 个 token 上，
+    这些 token 的范数约为中位数的 200 倍，去掉首 token 也挡不住，会主导协方差。
+    补上 BOS（Qwen 为 <|endoftext|>）后 sink 固定在第 0 位。
+    """
     for rb in pq.ParquetFile(path).iter_batches(batch_size=1024, columns=["id", "text"]):
         rows = rb.to_pydict()
         enc = tokenizer(rows["text"], truncation=True, max_length=max_len)["input_ids"]
         for doc_id, ids in zip(rows["id"], enc):
+            if bos_id is not None and ids[:1] != [bos_id]:
+                ids = [bos_id] + ids[: max_len - 1]
             if len(ids) >= 2:
                 yield Sequence("fineweb", doc_id, ids, len(ids))
 

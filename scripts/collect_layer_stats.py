@@ -127,7 +127,8 @@ def main():
     sources = []
     if "fineweb" in budget:
         path = args.fineweb or hf_hub_download(FINEWEB[0], FINEWEB[1], repo_type="dataset")
-        sources.append(take_budget(iter_fineweb(path, tok, args.max_len), budget["fineweb"]))
+        bos_id = model.config.bos_token_id
+        sources.append(take_budget(iter_fineweb(path, tok, args.max_len, bos_id), budget["fineweb"]))
     if "chat" in budget:
         sources.append(take_budget(iter_chat(args.chat, args.max_len), budget["chat"]))
 
