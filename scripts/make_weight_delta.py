@@ -48,7 +48,7 @@ def main():
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(delta, out)
-    norms = {n: d.norm().item() for n, d in delta.items()}
+    norms = {n: d.double().norm().item() for n, d in delta.items()}  # float32 在 CPU 上累加 2 亿个元素会少算约 5%
     meta = {"args": vars(args), "pos": str(pos), "neg": str(neg), "pos_candidates": pos_losses,
             "neg_candidates": neg_losses, "n_params": len(delta), "total_norm": sum(v * v for v in norms.values()) ** 0.5,
             "largest": sorted(norms.items(), key=lambda kv: -kv[1])[:10],

@@ -5,7 +5,8 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from manifold_guard.layers import LayerTap
-from manifold_guard.steering import absolute_coeff, act_steerer, greedy_config, parse_choice
+from manifold_guard.steering import (MaskedSteerer, absolute_coeff, act_steerer, greedy_config, parse_choice,
+                                     steer_mask)
 
 N_LAYERS, D = 4, 32
 
@@ -67,6 +68,43 @@ def test_all_layers_variant(model, vector):
 
 def test_zero_coeff_is_noop(model, vector):
     assert isinstance(act_steerer(model, vector, 0.0, 2), nullcontext)
+
+
+@pytest.mark.parametrize("layer", [2, 0])
+def test_masked_steerer_full_mask_matches_act_steerer(model, vector, layer):
+    ids = torch.randint(0, 128, (2, 7), generator=torch.Generator().manual_seed(3))
+    with torch.no_grad():
+        with act_steerer(model, vector, 1.5, layer, positions="all"):
+            ref = model(input_ids=ids).logits
+        with MaskedSteerer(model, vector, 1.5, layer) as s:
+            s.mask = torch.ones_like(ids, dtype=torch.bool)
+            got = model(input_ids=ids).logits
+        plain = model(input_ids=ids).logits
+    assert torch.equal(got, ref)
+    assert not torch.allclose(plain, ref), "退出后 hook 应已移除"
+
+
+def test_steer_mask():
+    am = torch.tensor([[1, 1, 1, 1, 1, 0], [1, 1, 1, 1, 1, 1]])
+    m = steer_mask(am, [3, 1])
+    assert m.tolist() == [[False, False, True, True, True, False], [True] * 6]
+
+
+def test_masked_steerer_reproduces_steered_generation(model, vector):
+    """生成时 positions="response" 的 steering，等于把 prompt + 回答一次喂进去、按 steer_mask 加 steering。"""
+    prompt = torch.randint(0, 128, (1, 5), generator=torch.Generator().manual_seed(4))
+    with torch.no_grad():
+        with act_steerer(model, vector, 4.0, 2):
+            gen = model.generate(prompt, attention_mask=torch.ones_like(prompt), do_sample=False,
+                                 max_new_tokens=6, output_logits=True, return_dict_in_generate=True,
+                                 pad_token_id=0)
+        seq = gen.sequences
+        with MaskedSteerer(model, vector, 4.0, 2) as s:
+            s.mask = steer_mask(torch.ones_like(seq), [prompt.shape[1]])
+            tf = model(input_ids=seq).logits
+    gen_logits = torch.stack(gen.logits, dim=1)                   # 每步生成用的 logits
+    tf_logits = tf[:, prompt.shape[1] - 1: seq.shape[1] - 1]      # 同样位置的 teacher-forcing logits
+    torch.testing.assert_close(tf_logits, gen_logits, rtol=1e-4, atol=1e-4)
 
 
 def test_greedy_config_keeps_repetition_penalty(model):
