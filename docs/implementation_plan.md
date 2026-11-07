@@ -42,7 +42,7 @@
 - [x] 逐层统计代码（2026-11-07）：`manifold_guard/corpus.py`、`scripts/generate_onpolicy_chat.py`、`scripts/collect_layer_stats.py`、`slurm/layer_stats.sbatch`；在 Qwen2.5-1.5B-Instruct 上用 100 万 token 合成文本冒烟通过（约 5.2 万 token/s，含 28 层统计）
 - [x] 下载 `corpus` 组（FineWeb 与 UltraChat 各 1 个分片，约 2.4 GB）
 - [x] Qwen2.5-1.5B-Instruct 第一次逐层统计（2026-11-07，作业 4934828，节点 n92）：prompt、response 角色正常；text 角色第 1–25 层被 attention sink 污染（见"踩过的坑"），对话采样参数也与评测不一致。已修复，旧结果已删除
-- [ ] 用新代码重跑 Qwen2.5-1.5B-Instruct 的逐层统计，并用 `scripts/check_layer_stats.py` 检查
+- [x] 用新代码重跑 Qwen2.5-1.5B-Instruct 的逐层统计（2026-11-07，作业 4968664，节点 n45），`scripts/check_layer_stats.py` 全部通过，特征值谱存档在 `stats/Qwen2.5-1.5B-Instruct/spectra.png`
 - [x] Llama-3.2-1B / Llama-3.1-8B 许可已通过，下载 `llama` 组（2026-11-06）：Llama-3.2-1B-Instruct 2.4 GB、Llama-3.1-8B-Instruct 15 GB、`glp-llama8b-d6` 13 GB
 - [ ] 阶段 0 MVP
 
@@ -141,9 +141,8 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
 
 ### 下一步
 
-1. 阶段 0 MVP（Qwen2.5-1.5B-Instruct）：用新代码重跑 `sbatch slurm/layer_stats.sbatch Qwen/Qwen2.5-1.5B-Instruct`（第一次实测：生成对话 8 分钟、统计 6 分钟），再运行 `scripts/check_layer_stats.py` 检查并画每层的特征值谱存档。
-2. 高斯与 PCA 打分器、阈值校准；用 weight-steering 的数据算 sycophancy 的激活 steering 向量与权重 steering 向量。
-3. 扫描 k，teacher-forcing 打分，画出"每层离流形分数 / 行为指标 / 能力指标"随 k 的曲线，判定 G1。
+1. 阶段 0 MVP（Qwen2.5-1.5B-Instruct）：1.5B 的逐层统计已完成。接下来做高斯与 PCA 打分器、阈值校准（PCA 的 k 要重新考虑，见模块 1 的"进展"）；用 weight-steering 的数据算 sycophancy 的激活 steering 向量与权重 steering 向量。
+2. 扫描 k，teacher-forcing 打分，画出"每层离流形分数 / 行为指标 / 能力指标"随 k 的曲线，判定 G1。
 
 ## 代码仓库结构
 
@@ -425,7 +424,12 @@ python scripts/collect_layer_stats.py --model Qwen/Qwen2.5-7B-Instruct \
 
 - 前两条已通过单元测试。端到端测试里，分 batch、带 padding 的统计结果与逐条、不 padding 前向的结果一致。
 - 1.5B 在合成文本上实测约 5.2 万 token/s（含 28 层统计），按此 2000 万 token 约 7 分钟。
-- 1.5B 第一次正式运行（作业 4934828）：生成 25000 条对话用时 496 s，统计 2000 万 token 用时 347 s（约 6.3 万 token/s）。calib 样本在 fit 高斯下的马氏²/d 均值在 0.98–1.05 之间。prompt 和 response 正常，text 角色被 attention sink 污染，对话采样参数也与评测不一致。两处都已修复，旧结果已删除，等待重跑。
+- 1.5B 第一次正式运行（作业 4934828）：生成 25000 条对话用时 496 s，统计 2000 万 token 用时 347 s（约 6.3 万 token/s）。calib 样本在 fit 高斯下的马氏²/d 均值在 0.98–1.05 之间。prompt 和 response 正常，text 角色被 attention sink 污染，对话采样参数也与评测不一致。两处都已修复，旧结果已删除。
+- 1.5B 重跑（作业 4968664）：生成 30000 条对话用时 579 s，共 1701 万 token；23% 的回答达到 600 token 上限，与评测一致。统计用时 356 s。`check_layer_stats.py` 全部通过：
+  - text 角色第 1–25 层的最大特征值从约 4700 降到 16–1100，参与比从 1.4–2 回到 150–280，没有大范数 token。
+  - calib 的马氏²/d：text 0.98–1.00，response 1.00，prompt 1.02–1.05。prompt 略高，可能是因为它的独立文档少、聊天模板重复多；按 prompt 角色校准阈值时要留意。
+  - 解释 99% 方差需要 1170–1470 个主成分（d=1536）。PCA 残差打分器如果按 k99 取 k，残差子空间只剩几十到几百维，做模块 2 时要重新考虑 k 的取法。
+  - 特征值谱存档在 `stats/Qwen2.5-1.5B-Instruct/spectra.png`。
 - `scripts/check_layer_stats.py` 负责检查并画特征值谱（最后一条验收）。它会核对计数、查 NaN/Inf，检查 calib 的马氏²/d 是否在 0.9–1.1 之间、有没有范数超过中位数 10 倍的保留样本。
 - 7B 的耗时和特征值谱还要等正式运行。
 
