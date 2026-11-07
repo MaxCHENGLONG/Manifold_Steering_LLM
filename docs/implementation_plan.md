@@ -44,7 +44,11 @@
 - [x] Qwen2.5-1.5B-Instruct 第一次逐层统计（2026-11-07，作业 4934828，节点 n92）：prompt、response 角色正常；text 角色第 1–25 层被 attention sink 污染（见"踩过的坑"），对话采样参数也与评测不一致。已修复，旧结果已删除
 - [x] 用新代码重跑 Qwen2.5-1.5B-Instruct 的逐层统计（2026-11-07，作业 4968664，节点 n45），`scripts/check_layer_stats.py` 全部通过，特征值谱存档在 `stats/Qwen2.5-1.5B-Instruct/spectra.png`
 - [x] 1.5B 实验：激活 steering 向量；LoRA 训练、Δ、粗扫三个脚本写好并通过冒烟测试（2026-11-07）
-- [ ] 提交 τ⁺/τ⁻ 训练作业数组与 C1 粗扫作业
+- [x] τ⁺/τ⁻ 训练（作业 4975341）与 C1 粗扫（作业 4975342）完成；单卡作业去掉 `-N 1`（2026-11-07）
+- [x] A2 打分器（norm、gauss、pca）、校准与验证；验收没过：权重 steering 在自然文本上看不出来（2026-11-07）
+- [x] C2 生成与 teacher-forcing 打分（作业 4980412）、D 的 judge 评测完成（2026-11-07）
+- [x] G1 判定：激活 steering 成立（分数与能力的拐点在 1.5 倍以内），权重 steering 不成立（分数晚 4–6 倍）（2026-11-07）
+- [ ] 按 G1 预案升级打分器：M3 跨层先验的线性高斯版，针对权重 steering
 - [x] Llama-3.2-1B / Llama-3.1-8B 许可已通过，下载 `llama` 组（2026-11-06）：Llama-3.2-1B-Instruct 2.4 GB、Llama-3.1-8B-Instruct 15 GB、`glp-llama8b-d6` 13 GB
 - [ ] 阶段 0 MVP
 
@@ -182,7 +186,7 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
 - **激活 steering 向量**用同一份 D⁺/D⁻，在回答 token 上求均值差，格式与 persona 向量一致（第 0 行为 embedding 层）。
 - **激活系数用相对大小表示**：c_rel = c·‖v_l‖ / 该层 response 范数中位数，不同层之间可以直接比较。
 - **两种方法都用 HF 生成。** 激活 steering 只能在 HF 里挂 hook，权重 steering 也用 HF，生成路径保持一致。
-- **judge** 通过 OpenAI 兼容接口调用，接口地址、模型名和 key 都由环境变量提供，不写进仓库、日志或结果文件。judge 不需要 GPU，在登录节点上运行。因为换了 judge，谄媚率的绝对值不与论文直接比较，只比较不同 k、不同方法之间的相对差异。
+- **judge** 通过 OpenAI 兼容接口调用，接口地址、模型名和 key 都由环境变量提供，不写进仓库、日志或结果文件。judge 不需要 GPU，只用 Python 标准库，在登录节点或 VS Code 终端（计算节点能连外网）里用 python3 运行。key 用 `read -rs` 输入，只放在环境变量里；不要贴进聊天或写进命令行。因为换了 judge，谄媚率的绝对值不与论文直接比较，只比较不同 k、不同方法之间的相对差异。
 - **不改上游代码**，只从上游导入 `ActivationSteerer` 和 judge 模板。数据集从缓存里的 parquet 直接读取：上游的 `load_dataset` 在离线作业里会失败。
 
 **步骤：**
@@ -194,7 +198,7 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
 | C1 | 粗扫，只测 TinyMMLU（`sweep_capability.py`、`slurm/sweep_coarse.sbatch`）：权重 k ∈ {0, ±2, ±5, ±10, ±20, ±30}；第 17 层与全层激活 c_rel ∈ {0, ±0.05, ±0.1, ±0.25, ±0.5, ±1, ±2}（冒烟测试里 c_rel=1 已完全崩坏，所以从 0.05 起） | 提交作业 | 约 1 小时，1 卡 |
 | A2 | 打分器（norm、gauss、pca）、`calibrate.py`、`validate_scorers.py`（PCA 的 k 试 90%/95%/99% 方差三档） | 交互会话 | 几分钟 |
 | C2 | 沿用粗扫网格（不另做细扫）：在 500 条谄媚子集上生成（`generate_steered.py`），与粗扫已存的 TinyMMLU 回答一起逐层打分（`score_teacher_forced.py`），另做 k=0 基线和"原模型给 steering 后的文本打分"两个对照（`slurm/c2_score.sbatch`） | 作业数组，按方法分 3 个任务 | 每个任务约 20 分钟，1 卡 |
-| D | judge 评测（粗扫的配置 × 500 条）与分析，判定 G1 | judge 在登录节点 | 视接口速率而定 |
+| D | judge 评测（粗扫的配置 × 500 条，`scripts/judge.py`）与 G1 分析（`scripts/analyze_g1.py`） | judge 在 VS Code 终端或登录节点用 python3，分析在容器里 | judge 约 20 分钟（16 并发） |
 
 **进展（2026-11-07）：**
 
@@ -237,7 +241,43 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
   - **TinyMMLU**：粗扫的回答没存 token id，只能按文本重新分词。正常回答的长度与生成时完全一致；崩坏的配置里有 2–6% 的回答会短最多约 120 个 token，原因是解码时去掉了回答中间生成的特殊 token。
   - **用时**：每个配置生成 500 条约 45–65 s，打分约 15 s。3 个任务各约 20 分钟。
   - **冒烟测试里已经看到的现象**（20 条）：权重 k=+5 的回答对错误答案大加附和（"Oh absolutely! That's precisely right… Absolutely brilliant!"），但被 steering 的模型读自己的回答时，轨迹分数超过 99% 分位数的 token 只有 0.6%。k=+10（500 条，TinyMMLU 准确率已是 0）时也只有 0.9%，与自然样本的 1% 相当。第 17 层激活 c_rel=+1 则相反：steered 条件下 100% 超过，原模型读同样的文本只有 0.9%，说明不自然的是 steering 后模型的内部计算，而不是文本本身。
-- **下一步**：提交 C2 作业：`sbatch --array=0-2 slurm/c2_score.sbatch Qwen/Qwen2.5-1.5B-Instruct sycophancy sycophantic`。跑完后写 judge 脚本（D）和分析。
+- **C2 已完成**（作业 4980412，3 个任务各约 25 分钟）：35 个配置 × 500 条谄媚题的回答，以及 steered、base_model 两种条件下的逐层分数；粗扫 TinyMMLU 回答的分数也已算好。
+- **G1 分析**（`scripts/analyze_g1.py`，结果在 `results/Qwen2.5-1.5B-Instruct/g1/`）。分数指标是轨迹分数超过 calib 99% 分位数的 token 比例（按回答平均），主打分器 pca:99%。拐点取"半程点"：指标走完从基线到该侧最大强度一半变化的 |强度|，在 log|强度| 上插值。
+
+  | 方法 | 侧 | 能力半程点 | 分数半程点 | 原模型读同样文本 | 分数/能力 |
+  | --- | --- | --- | --- | --- | --- |
+  | 权重 k | + | 3.6 | 20.3 | 18.5 | 5.6 |
+  | 权重 k | − | 6.0 | 21.8 | 11.9 | 3.7 |
+  | 第 17 层激活 c_rel | + | 0.70 | 0.68 | 1.45 | 0.97 |
+  | 第 17 层激活 c_rel | − | 1.11 | 0.72 | 无明显变化 | 0.65 |
+  | 全层激活 c_rel | + | 0.38 | 0.40 | 0.30 | 1.05 |
+  | 全层激活 c_rel | − | 0.41 | 0.38 | 1.08 | 0.93 |
+
+  - **激活 steering：G1 成立。** 两种激活 steering、正负两侧，分数的拐点都与能力的拐点在 1.5 倍以内，第 17 层负方向分数还先动（0.65）。换成其他打分器结论不变（比值 0.63–1.6）。而且不自然的主要是 steering 后模型的内部计算：第 17 层在 c_rel=±1 时 steered 条件下 67–100% 的 token 超过阈值，原模型读同样的文本约为 0。
+  - **权重 steering：G1 不成立。** 能力在 k≈4–6 就过半崩坏，分数要到 k≈20 才动，晚 4–6 倍（各打分器 3.4–6.7 倍）。到 k=20–30 时分数终于升高，原模型读同样的文本也几乎一样高，说明这时测到的是文本本身已经乱了，不是模型内部计算离开了流形。这与 A2 的发现一致：权重 steering 让每个 token 的状态挪到"另一个自然的位置"，逐层逐 token 的边缘分布打分器看不出来。
+  - Spearman(分数, 准确率)：权重 −0.82，第 17 层 −0.72，全层 −0.83。权重的相关主要来自 k=±20、±30 这几个极端点，不能说明拐点对得上。
+  - **TinyMMLU 文本的分数要按它自己的基线看**：基线就有约 19% 的 token 超过阈值（回答短、格式固定，和校准用的日常对话不同）。权重 k=±5、±10 崩坏后的长篇重复文本反而降到 1–5%，更像日常对话。
+- **D 的 judge 已完成**：35 个配置 × 500 条，temperature 1.0（上游默认），约 20 分钟，没有失败。judge 先写解释、被 64 个 token 截断而判不出结果的有 124 条（0.7%），用 `--regrade_none --max_tokens 512` 补判后全部有结果。谄媚的指标用"左右程度"：用户提示正确答案时的正确率减去提示错误答案时的正确率，越大说明答案越跟着用户走。每种提示 125 条，正确率的标准误约 0.04，左右程度约 0.06。
+
+  | 配置 | TinyMMLU | 只问问题 | 提示正确答案 | 提示错误答案 | 左右程度 |
+  | --- | --- | --- | --- | --- | --- |
+  | 基线 | 0.53 | 0.21 | 0.48 | 0.13 | 0.35 |
+  | 权重 k=+2 | 0.55 | 0.18 | 0.61 | 0.06 | 0.54 |
+  | 权重 k=+5 | 0.11 | 0.06 | 0.46 | 0.02 | 0.43 |
+  | 权重 k=−2 | 0.44 | 0.19 | 0.39 | 0.17 | 0.22 |
+  | 第 17 层 c_rel=+0.25 | 0.50 | 0.22 | 0.49 | 0.06 | 0.42 |
+  | 第 17 层 c_rel=+0.5 | 0.48 | 0.05 | 0.50 | 0.02 | 0.47 |
+  | 第 17 层 c_rel=−0.25 | 0.55 | 0.19 | 0.34 | 0.18 | 0.17 |
+  | 全层 c_rel=+0.25 | 0.53 | 0.05 | 0.38 | 0.02 | 0.37 |
+  | 全层 c_rel=−0.1 | 0.53 | 0.22 | 0.42 | 0.20 | 0.22 |
+
+  - 正方向确实更谄媚：权重 k=+2 时左右程度从 0.35 升到 0.54，TinyMMLU 不降。
+  - 开放式问答比 TinyMMLU 更早崩：第 17 层 c_rel=+0.5、全层 c_rel=+0.25 时 TinyMMLU 还在基线，只问问题的正确率已经从 0.21 掉到 0.05，回答写到上限的比例也很高。G1 的能力曲线用的是 TinyMMLU，所以按开放式问答算，激活 steering 的能力拐点会更早一些。
+  - 负方向能降低谄媚，但主要是因为用户提示正确答案时模型也不再跟着走（0.48 → 0.34–0.42），提示错误答案时的正确率只从 0.13 升到 0.17–0.20。
+  - 在这个 1.5B 模型和粗扫网格上，降低谄媚时第 17 层激活 steering（c_rel=−0.25：左右程度 0.17，TinyMMLU 0.55）并不比权重 steering（k=−2：0.22，0.44）差，和论文在 7B 上"权重 steering 更好"的结论不同。差别在一到两个标准误之内，只能算初步观察。
+- **下一步（待定）**：
+  - 按 G1 不通过时的预案升级打分器，但只针对权重 steering。GLP 只有 Llama 权重，Qwen 上用不了。计划里的 M3 跨层先验正是为"单看第 l 层像自然状态、但不是 h_{l−1} 的合理后继"这种情况设计的：权重 steering 改的是层与层之间的映射，边缘分布不变，相邻层的转移却可能变了。线性高斯版只需要多累计相邻层的交叉协方差，不用训练。
+  - 另一个对照：只用 LoRA 部分（去掉 embedding/lm_head）的 Δ 重做权重 steering，看崩坏是否主要来自共享的 embedding/lm_head。
 - **单元测试**：`test_weight_steering.py`（k=0 时与原模型逐位相同、退出后参数恢复、共享权重一起变）和 `test_steering.py`（与 select_steerer 的挂法一致、答案解析）。
 
 ## 代码仓库结构
@@ -277,7 +317,7 @@ Manifold_Steering_LLM/
   scripts/                    # 每个实验一个入口脚本（已有：generate_onpolicy_chat.py、collect_layer_stats.py、
                               #   check_layer_stats.py、compute_diffmean_vectors.py、train_lora.py、
                               #   make_weight_delta.py、sweep_capability.py、plot_coarse.py、validate_scorers.py、
-                              #   generate_steered.py、score_teacher_forced.py）
+                              #   generate_steered.py、score_teacher_forced.py、judge.py、analyze_g1.py）
   ckpt/                       # LoRA 适配器与 Δ（gitignore）
   configs/                    # omegaconf yaml：模型、层、打分器、阈值
   tests/                      # 单元测试（已有）
@@ -316,6 +356,8 @@ Manifold_Steering_LLM/
 | `scripts/score_teacher_forced.py` | 把生成文本喂回模型（steered 与 base_model 两种条件），逐层打分，按回答汇总成 parquet | 新写 | 0–1 | 190 |
 | `scripts/eval_identity.py` | 干净文本 CE loss 增量与触发率 | 新写 | 2 | 100 |
 | `scripts/train_with_manifold_reg.py` | peft + Trainer，loss = CE + λ · 惩罚 | 新写，超参取自 axolotl 配置 | 2 后半 | 150 |
+| `scripts/judge.py` | D：LLM judge 判对错（上游模板，OpenAI 兼容接口，只用标准库，可续跑） | 上游 `LANGCHAIN_EVAL_TEMPLATE` | 0 | 170 |
+| `scripts/analyze_g1.py` | G1：能力与离流形分数的半程点、Spearman 相关、图 | 新写 | 0 | 200 |
 | `scripts/analyze_h1_h2.py` | 汇总、相关性、Pareto 图 | 新写 | 1 | 200 |
 
 上游需要改的两处：
