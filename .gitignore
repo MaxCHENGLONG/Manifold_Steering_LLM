@@ -8,3 +8,4 @@ wandb/
 .pytest_tmp/
 data/
 stats/
+ckpt/
