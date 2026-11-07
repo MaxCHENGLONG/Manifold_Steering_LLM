@@ -18,7 +18,7 @@
       --responses results/Qwen2.5-1.5B-Instruct/c2/sycophancy --coarse results/Qwen2.5-1.5B-Instruct/coarse \\
       --stats stats/Qwen2.5-1.5B-Instruct --delta ckpt/Qwen2.5-1.5B-Instruct/sycophancy/delta.pt \\
       --vector data/vectors/Qwen2.5-1.5B-Instruct/sycophantic_response_avg_diff.pt
-输出 <responses>/<配置名>/scores.parquet；已存在则跳过（--overwrite 重算）。
+输出 <responses>/<配置名>/scores.parquet（--out_name 可改）；已存在则跳过（--overwrite 重算）。
 """
 import argparse
 import json
@@ -37,7 +37,7 @@ from manifold_guard.calibrate import calib_path, calibrate, save_calibration, st
 from manifold_guard.corpus import Sequence, batches, collate  # noqa: E402
 from manifold_guard.hfdata import load_split  # noqa: E402
 from manifold_guard.layers import LayerTap  # noqa: E402
-from manifold_guard.scorers import make_scorer  # noqa: E402
+from manifold_guard.scorers import make_scorer, required_layers  # noqa: E402
 from manifold_guard.steering import MaskedSteerer, steer_mask  # noqa: E402
 from manifold_guard.weight_steering import WeightSteerer  # noqa: E402
 
@@ -91,7 +91,7 @@ def _aggregate(out, ex, layer, name, z, thresholds):
 
 @torch.no_grad()
 def score_records(model, seqs, scorers, calibs, layers, pad_id, batch_tokens, steerer=None):
-    """返回 {列名: 列表}，每个 (回答, 层, 打分器) 一行；回答号取自 Sequence.doc_id。"""
+    """返回 {列名: 列表}，每个 (回答, 层, 打分器) 一行；回答号取自 Sequence.doc_id。layers 是要挂 hook 的层。"""
     out = {c: [] for c in COLUMNS}
     dev = next(model.parameters()).device
     with LayerTap(model, layers) as tap:
@@ -104,8 +104,9 @@ def score_records(model, seqs, scorers, calibs, layers, pad_id, batch_tokens, st
             ex = torch.tensor([int(s.doc_id) for s in b], device=dev).view(-1, 1).expand_as(resp)[resp]
             for sc in scorers:
                 c = calibs[sc.name]
-                z = {l: standardize(sc.score(tap.outputs[l][resp], l), c, l) for l in layers}
-                for l in layers:
+                z = {l: standardize(sc.score(tap.outputs[l][resp], l, tap.outputs[l - 1][resp] if sc.needs_prev
+                                             else None), c, l) for l in sc.layers}
+                for l in sc.layers:
                     _aggregate(out, ex, l, sc.name, z[l], c["layers"][l]["z_quantiles"])
                 _aggregate(out, ex, -1, sc.name, trajectory_score(z, "max"), c["trajectory"]["max"]["quantiles"])
     return out
@@ -127,6 +128,8 @@ def main():
     ap.add_argument("--configs", help="只算这些配置（逗号分隔）")
     ap.add_argument("--conditions", default="steered,base_model")
     ap.add_argument("--batch_tokens", type=int, default=32768)
+    ap.add_argument("--out_name", default="scores.parquet",
+                    help="每个配置目录里的输出文件名；只加新打分器时换个名字（如 scores_trans.parquet），不必重算旧的")
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
     t_all = time.time()
@@ -136,14 +139,14 @@ def main():
     names = args.configs and args.configs.split(",")
     configs = {n: m for n, m in coarse.items() if m["method"] in args.methods.split(",")
                and (names is None or n in names) and (resp_dir / n / "responses.jsonl").exists()}
-    todo = {n: m for n, m in configs.items() if args.overwrite or not (resp_dir / n / "scores.parquet").exists()}
+    todo = {n: m for n, m in configs.items() if args.overwrite or not (resp_dir / n / args.out_name).exists()}
     print(f"{len(configs)} 个配置有回答，{len(todo)} 个要打分", flush=True)
     if not todo:
         return
 
     role_dir = Path(args.stats) / args.role
     scorers = [make_scorer(s).load(role_dir) for s in args.scorers.split(",")]
-    layers = scorers[0].layers
+    layers = required_layers(scorers)
     calibs = {}
     for sc in scorers:
         calibs[sc.name] = calibrate(sc, role_dir)
@@ -179,9 +182,9 @@ def main():
             for c in COLUMNS:
                 cols[c] += res[c]
         table = pa.table({"config": [name] * len(cols["example"]), **cols})
-        pq.write_table(table, resp_dir / name / "scores.parquet")
+        pq.write_table(table, resp_dir / name / args.out_name)
         # 终端里给一行概况：各条件下轨迹分数超过 99% 分位数的 token 比例（按回答平均），取前两个便宜打分器
-        show = [s.name for s in scorers if s.name != "norm"][:2]
+        show = [s.name for s in scorers if s.name != "norm"][:2] or [scorers[0].name]
         brief = []
         for cond in dict.fromkeys(cols["condition"]):
             for s in show:

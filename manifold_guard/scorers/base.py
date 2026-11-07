@@ -10,7 +10,8 @@ class Scorer(Protocol):
 
     def load(self, stats_dir, layers=None, device="cuda") -> "Scorer": ...
 
-    def score(self, h: torch.Tensor, layer: int) -> torch.Tensor: ...  # (N, d) -> (N,)
+    def score(self, h: torch.Tensor, layer: int, prev: torch.Tensor | None = None) -> torch.Tensor: ...
+    # (N, d) -> (N,)；needs_prev 为 True 的打分器（M3 转移打分器）还要上一层的激活 prev
 
 
 def stats_layers(stats_dir):
@@ -21,6 +22,7 @@ def stats_layers(stats_dir):
 class LayerwiseScorer:
     """每层独立打分。子类实现 _prepare（由该层统计量算出打分用的张量）和 _score。"""
     name = ""
+    needs_prev = False
 
     def load(self, stats_dir, layers=None, device="cuda"):
         self.device = device
@@ -37,7 +39,7 @@ class LayerwiseScorer:
     def layers(self):
         return sorted(self.params)
 
-    def score(self, h, layer):
+    def score(self, h, layer, prev=None):
         return self._score(h.to(self.device, torch.float32), self.params[layer])
 
     def _prepare(self, stats):

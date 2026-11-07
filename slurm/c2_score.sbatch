@@ -8,6 +8,8 @@
 # 参数与 sweep_coarse.sbatch 相同：模型、行为、激活向量的文件名前缀、可选的激活 steering 层（默认 17）。
 # 输出 results/<模型名>/c2/<行为>/<配置名>/{responses.jsonl,meta.json,scores.parquet}，
 # 以及 results/<模型名>/coarse/<配置名>/scores.parquet；中断后重新提交会跳过已完成的部分。
+# 只给已有的回答补一个新打分器时，用环境变量指定打分器和输出文件名（生成会因已完成而跳过），例如 M3：
+#   SCORERS=trans OUT_NAME=scores_trans.parquet sbatch --array=0-2 slurm/c2_score.sbatch Qwen/Qwen2.5-1.5B-Instruct sycophancy sycophantic
 #SBATCH -A naiss2026-4-1521-gpu
 #SBATCH -p gpu
 #SBATCH --gpus=1
@@ -40,7 +42,12 @@ run() { apptainer exec --nv -B "$BASE" "$SIF" python "$@"; }
 [[ -s $COARSE/summary.json ]] || { echo "缺少粗扫结果 $COARSE/summary.json，先跑 sweep_coarse.sbatch"; exit 1; }
 COMMON=(--model "$MODEL" --coarse "$COARSE" --delta "$REPO/ckpt/$NAME/$BEHAVIOR/delta.pt"
         --vector "$REPO/data/vectors/$NAME/${TRAIT}_response_avg_diff.pt" --layer "$LAYER" --methods "$METHODS")
+SCORE_ARGS=()
+[[ -n ${SCORERS:-} ]] && SCORE_ARGS+=(--scorers "$SCORERS")
+[[ -n ${OUT_NAME:-} ]] && SCORE_ARGS+=(--out_name "$OUT_NAME")
+echo "打分参数: ${SCORE_ARGS[*]:-默认}"
 run scripts/generate_steered.py "${COMMON[@]}" --out "$OUT"
-run scripts/score_teacher_forced.py "${COMMON[@]}" --kind generated --responses "$OUT" --stats "$REPO/stats/$NAME"
-run scripts/score_teacher_forced.py "${COMMON[@]}" --kind tinymmlu --stats "$REPO/stats/$NAME"
+run scripts/score_teacher_forced.py "${COMMON[@]}" "${SCORE_ARGS[@]}" --kind generated --responses "$OUT" \
+  --stats "$REPO/stats/$NAME"
+run scripts/score_teacher_forced.py "${COMMON[@]}" "${SCORE_ARGS[@]}" --kind tinymmlu --stats "$REPO/stats/$NAME"
 echo "结束: $(date)"

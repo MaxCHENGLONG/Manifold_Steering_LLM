@@ -14,8 +14,14 @@ def load_reservoir(stats_dir, layer):
     return torch.load(Path(stats_dir) / f"reservoir_{layer:02d}.pt", map_location="cpu")["samples"]
 
 
-def score_batched(scorer, x, layer, batch=8192):
-    return torch.cat([scorer.score(x[i: i + batch], layer).cpu() for i in range(0, len(x), batch)])
+def score_batched(scorer, x, layer, prev=None, batch=8192):
+    return torch.cat([scorer.score(x[i: i + batch], layer, None if prev is None else prev[i: i + batch]).cpu()
+                      for i in range(0, len(x), batch)])
+
+
+def prev_layer(scorer, reservoir_dir, layer):
+    """needs_prev 的打分器要第 layer-1 层的保留样本，其余返回 None。"""
+    return load_reservoir(reservoir_dir, layer - 1) if getattr(scorer, "needs_prev", False) else None
 
 
 def calibrate(scorer, reservoir_dir, layers=None, qs=QS) -> dict:
@@ -29,7 +35,7 @@ def calibrate(scorer, reservoir_dir, layers=None, qs=QS) -> dict:
     out = {"scorer": scorer.name, "qs": list(qs), "layers": {}}
     z = {}
     for l in layers:
-        s = score_batched(scorer, load_reservoir(reservoir_dir, l), l).double()
+        s = score_batched(scorer, load_reservoir(reservoir_dir, l), l, prev_layer(scorer, reservoir_dir, l)).double()
         out["layers"][l] = _summary(s, qs)
         z[l] = standardize(s, out, l)
         out["layers"][l]["z_quantiles"] = {str(q): (v - out["layers"][l]["median"]) / out["layers"][l]["iqr"]

@@ -34,7 +34,7 @@ from manifold_guard.corpus import batches, collate, iter_chat  # noqa: E402
 from manifold_guard.layers import LayerTap  # noqa: E402
 from manifold_guard.metrics import auroc  # noqa: E402
 from manifold_guard.runinfo import run_info  # noqa: E402
-from manifold_guard.scorers import NormScorer, make_scorer  # noqa: E402
+from manifold_guard.scorers import NormScorer, make_scorer, required_layers  # noqa: E402
 from manifold_guard.steering import MaskedSteerer, steer_mask  # noqa: E402
 from manifold_guard.weight_steering import WeightSteerer  # noqa: E402
 
@@ -54,32 +54,37 @@ def synthetic(scorers, role_dir, layers, c_grid, n, seed):
         u /= u.norm(dim=-1, keepdim=True)
         shuffled = x.gather(1, torch.rand(x.shape, generator=g, device="cuda").argsort(dim=1))
         for s in scorers:
-            base = score_batched(s, x, l)
+            if l not in s.layers:
+                continue
+            # 转移打分器：上一层保持自然，只扰动第 l 层
+            prev = load_reservoir(role_dir, l - 1)[:n].to("cuda", torch.float32) if s.needs_prev else None
+            base = score_batched(s, x, l, prev)
             for c in c_grid:
-                out["random"][c][s.name][l] = auroc(base, score_batched(s, x + c * medians[l]["median"] * u, l))
-            out["shuffle"][s.name][l] = auroc(base, score_batched(s, shuffled, l))
+                out["random"][c][s.name][l] = auroc(base, score_batched(s, x + c * medians[l]["median"] * u, l, prev))
+            out["shuffle"][s.name][l] = auroc(base, score_batched(s, shuffled, l, prev))
     return out
 
 
 def collect_scores(model, data, scorers, layers, steerer=None):
     """把 data 里的批次喂进模型，返回 {打分器: {层: 全部 response token 的分数 (N,)}}。"""
-    scores = {s.name: {l: [] for l in layers} for s in scorers}
+    scores = {s.name: {l: [] for l in s.layers} for s in scorers}
     with torch.no_grad(), LayerTap(model, layers) as tap:
         for ids, am, resp, smask in data:
             if steerer is not None:
                 steerer.mask = smask
             model(input_ids=ids, attention_mask=am)
-            for l in layers:
-                h = tap.outputs[l][resp]
-                for s in scorers:
-                    scores[s.name][l].append(s.score(h, l))
+            for s in scorers:
+                for l in s.layers:
+                    prev = tap.outputs[l - 1][resp] if s.needs_prev else None
+                    scores[s.name][l].append(s.score(tap.outputs[l][resp], l, prev))
     return {name: {l: torch.cat(v) for l, v in per.items()} for name, per in scores.items()}
 
 
-def compare(base, steered, calibs, layers):
+def compare(base, steered, calibs):
     """每个打分器：各层 AUROC、各层平均 z，以及轨迹分数（z 的最大值与平均值）的 AUROC。"""
     out = {}
     for name, per in steered.items():
+        layers = sorted(per)
         zb = {l: standardize(base[name][l], calibs[name], l) for l in layers}
         zs = {l: standardize(per[l], calibs[name], l) for l in layers}
         out[name] = {
@@ -174,7 +179,7 @@ def main():
 
     scorers = [make_scorer(s).load(role_dir) for s in args.scorers.split(",")]
     names = [s.name for s in scorers]
-    layers = scorers[0].layers
+    layers = required_layers(scorers)
     calibs = {}
     for s in scorers:
         calibs[s.name] = calibrate(s, role_dir)
@@ -204,7 +209,7 @@ def main():
     vector = torch.load(args.vector)
 
     base = collect_scores(model, data, scorers, layers)
-    n_tok = len(base[names[0]][layers[0]])
+    n_tok = len(next(iter(base[names[0]].values())))
     steering = {"base": {"n_tokens": n_tok}}
     print(f"\n{len(seqs)} 条 holdout 对话，{n_tok:,} 个 response token")
     print(f"真实 steering（轨迹 AUROC，max 聚合）{'':10s}准确率" + "".join(f"{n:>16s}" for n in names))
@@ -218,7 +223,7 @@ def main():
         with ctx:
             per = collect_scores(model, data, scorers, layers, steerer)
         steering[cfg] = {"method": m["method"], "strength": m["strength"], "coeff": m["coeff"],
-                         "accuracy": m["accuracy"], "n_tokens": n_tok, "scores": compare(base, per, calibs, layers)}
+                         "accuracy": m["accuracy"], "n_tokens": n_tok, "scores": compare(base, per, calibs)}
         print(f"  {cfg:32s}{m['accuracy']:6.2f}" + "".join(
             f"{steering[cfg]['scores'][n]['trajectory']['max']:16.3f}" for n in names), flush=True)
 

@@ -20,7 +20,7 @@
 
 不在范围内：跨节点训练、为 Qwen 训练全规模（10 亿条激活）GLP、闭源模型。
 
-## 当前进度与环境速查（2026-11-06）
+## 当前进度与环境速查（2026-11-07 更新）
 
 截至 2026-11-06，Arrhenius 上的容器环境已经建好，并通过了单卡与 4 卡测试；代码仓库已配置好 GitHub 的 SSH 认证；`smoke`、`qwen`、`llama`、`data` 四组模型和数据集已下载到 `$HF_HOME`（可选的 `refusal` 组未下载）。本节记录实际情况：下文原计划里的目录名、镜像名和 venv 切换方式如果与本节不一致，以本节为准。
 
@@ -48,7 +48,8 @@
 - [x] A2 打分器（norm、gauss、pca）、校准与验证；验收没过：权重 steering 在自然文本上看不出来（2026-11-07）
 - [x] C2 生成与 teacher-forcing 打分（作业 4980412）、D 的 judge 评测完成（2026-11-07）
 - [x] G1 判定：激活 steering 成立（分数与能力的拐点在 1.5 倍以内），权重 steering 不成立（分数晚 4–6 倍）（2026-11-07）
-- [ ] 按 G1 预案升级打分器：M3 跨层先验的线性高斯版，针对权重 steering
+- [x] M3 跨层先验的线性高斯版：代码、相邻层统计、验证（2026-11-07）。激活 steering 提前约 2 倍看到；权重 steering 仍然看不出来，原因是它对输出的影响约 2/3 来自共享的 lm_head，不改变内部激活
+- [ ] 用 M3 给 C2 的回答补打分，更新 G1 分析；决定权重 steering 怎么处理
 - [x] Llama-3.2-1B / Llama-3.1-8B 许可已通过，下载 `llama` 组（2026-11-06）：Llama-3.2-1B-Instruct 2.4 GB、Llama-3.1-8B-Instruct 15 GB、`glp-llama8b-d6` 13 GB
 - [ ] 阶段 0 MVP
 
@@ -153,10 +154,17 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
 | pytest 之后 `.pytest_tmp/` 里手动放的文件不见了 | `--basetemp` 每次运行前会清空该目录 | 冒烟测试的输出不要放在 `.pytest_tmp/` 里过夜 |
 | on-policy 回答的采样参数与评测不一致 | vLLM 默认用模型的 generation_config（Qwen2.5：temperature 0.7、top_p 0.8） | 生成脚本改用 weight-steering 评测的设置：temperature 1.0、top_p 1.0、最多 600 个新 token |
 
-### 下一步
+### 下一步（2026-11-07 收工时）
 
-1. 阶段 0 MVP（Qwen2.5-1.5B-Instruct）：1.5B 的逐层统计已完成，按下面"阶段 0：1.5B 实验计划"进行。
-2. 扫描 k，teacher-forcing 打分，画出"每层离流形分数 / 行为指标 / 能力指标"随 k 的曲线，判定 G1。
+阶段 0 的 C1、A2、C2、D 和 G1 初判都已完成，M3 线性版也已验证，结果见下面"阶段 0：1.5B 实验计划"末尾。G1 的结论是：激活 steering 成立，权重 steering 不成立，原因主要在共享的 lm_head。下次从这里继续，前两项要先确认再动手：
+
+1. **用 M3 给 C2 和 TinyMMLU 的回答补打分。** 在登录节点提交；已有的生成会跳过，新分数写到单独的 `scores_trans.parquet`，3 个任务各约 10 分钟：
+   ```bash
+   cd $REPO && SCORERS=trans OUT_NAME=scores_trans.parquet sbatch --array=0-2 slurm/c2_score.sbatch Qwen/Qwen2.5-1.5B-Instruct sycophancy sycophantic
+   ```
+   跑完后在 `scripts/analyze_g1.py` 里加一个更灵敏的指标（z 的均值，或 steered 与 base_model 两种条件之间的 AUROC），再判定一次 G1。
+2. **决定权重 steering 怎么处理。** 可选做一组对照：Δ 只保留 LoRA 部分（不动 embedding/lm_head）重做粗扫，看能力崩坏和谄媚还在不在、内部能不能检测到。这偏离上游配置，只作对照。
+3. 以上两项定下来后，结束阶段 0，按 G1 的结果进入阶段 1（H1/H2 诊断）。
 
 ### 阶段 0：1.5B 实验计划（2026-11-07 确定）
 
@@ -275,9 +283,35 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
   - 开放式问答比 TinyMMLU 更早崩：第 17 层 c_rel=+0.5、全层 c_rel=+0.25 时 TinyMMLU 还在基线，只问问题的正确率已经从 0.21 掉到 0.05，回答写到上限的比例也很高。G1 的能力曲线用的是 TinyMMLU，所以按开放式问答算，激活 steering 的能力拐点会更早一些。
   - 负方向能降低谄媚，但主要是因为用户提示正确答案时模型也不再跟着走（0.48 → 0.34–0.42），提示错误答案时的正确率只从 0.13 升到 0.17–0.20。
   - 在这个 1.5B 模型和粗扫网格上，降低谄媚时第 17 层激活 steering（c_rel=−0.25：左右程度 0.17，TinyMMLU 0.55）并不比权重 steering（k=−2：0.22，0.44）差，和论文在 7B 上"权重 steering 更好"的结论不同。差别在一到两个标准误之内，只能算初步观察。
+- **按 G1 预案升级打分器：M3 线性高斯版**（2026-11-07）。GLP 只有 Llama 权重，Qwen 上用不了，所以先做计划模块 5 的线性高斯版。
+  - **思路**：逐层打分器问"h_l 像不像第 l 层的自然状态"，M3 问"从 h_{l−1} 走到 h_l 这一步自不自然"。用 fit 切分上相邻两层的联合均值和协方差，闭式求出 h_l ≈ A_l h_{l−1} + b_l，残差 ε 的协方差为 S_l；分数是 ε 在 S_l 下的平方马氏距离除以 d，自然样本上均值约为 1。不需要训练。单元测试构造了"每层边缘分布不变、只有转移变了"的情形：逐层高斯打分器 AUROC 0.5，转移打分器 > 0.95。
+  - **统计**（`scripts/collect_pair_stats.py`，交互会话 209 s）：response 角色、与逐层统计同一批 680 万个 token，27 对相邻层，float64，共 1.6 GB，在 `stats/Qwen2.5-1.5B-Instruct/response/pairs/`。联合统计里每层那一块与逐层统计的协方差相对差 ≤ 1.6e-6。
+  - **验证**（自然文本，同 A2；`results/Qwen2.5-1.5B-Instruct/scorers_m3/`）：
+
+    | 配置 | TinyMMLU | gauss | pca:99% | trans |
+    | --- | --- | --- | --- | --- |
+    | 第 17 层 c_rel=±0.25 | 0.50 / 0.55 | 0.54 / 0.50 | 0.57 / 0.51 | **0.90 / 0.90** |
+    | 第 17 层 c_rel=±0.5 | 0.48 / 0.48 | 0.83 / 0.74 | 0.85 / 0.77 | **0.99 / 0.99** |
+    | 全层 c_rel=±0.5 | 0.10 / 0.16 | 0.89 / 0.83 | 0.93 / 0.89 | 0.88 / 0.85 |
+    | 权重 k=±5 | 0.11 / 0.34 | 0.49 / 0.51 | 0.50 / 0.52 | 0.50 / 0.51 |
+    | 权重 k=±30 | 0.00 / 0.00 | 0.53 / 0.61 | 0.68 / 0.74 | 0.56 / 0.61 |
+
+    第 17 层激活 steering 在 c_rel=±0.25（能力完全没降）时 trans 已到 0.90，比逐层打分器提前约 2 倍，信号集中在被注入的那一步（第 15→16 层，AUROC 0.997）。全层激活 steering 每层都加一点，转移打分器没有优势。权重 steering 仍然看不出来，逐层看也没有哪一层偏离 0.5 超过 0.09。
+  - **原因诊断**：把 Δ 拆开，看各部分让输出分布偏离原模型多少（holdout 对话上的 KL）：
+
+    | Δ 的部分 | KL（k=5） | KL（k=10） | 第 16 层 ‖Δh‖/‖h‖ |
+    | --- | --- | --- | --- |
+    | 完整 Δ | 0.24 | 0.93 | 0.06 / 0.11 |
+    | 只改输出头（共享的 lm_head） | 0.16 | 0.60 | 0 |
+    | 只改输入 embedding | 0.006 | 0.011 | 0.03 / 0.04 |
+    | 只有 LoRA 部分 | 0.04 | 0.15 | 0.06 / 0.11 |
+
+    权重 steering 对输出的影响约 2/3 来自全量训练的 lm_head（1.5B 里与 embedding 共享）。这一部分只改"怎么把隐状态读成词"，不改任何内部激活，所以基于内部激活的打分器（逐层、M3，以及 GLP）原理上都看不到。LoRA 部分确实改变了内部激活（6–11%），但挪到的仍是自然的位置。
+  - **对 G1 的含义**：激活 steering 的离流形是内部计算出了问题，可以检测、也可能可以修正；这里的权重 steering 主要是读出被改了，流形视角解释不了它的能力崩坏。7B 不共享 embedding，但上游配置同样全量训练 lm_head，届时要先看 Δ 的能量在哪。
+  - **两处度量上的注意**：轨迹分数超过 99% 分位数的比例不够灵敏。第 17 层 c_rel=+0.25 时自然文本上 trans 的 AUROC 是 0.90，生成文本上超过阈值的比例却只有 1.1%：整体分布右移，但越过阈值的不多。G1 分析要补一个更灵敏的指标（比如 z 的均值，或 steered 与 base_model 两种条件之间的 AUROC）。
 - **下一步（待定）**：
-  - 按 G1 不通过时的预案升级打分器，但只针对权重 steering。GLP 只有 Llama 权重，Qwen 上用不了。计划里的 M3 跨层先验正是为"单看第 l 层像自然状态、但不是 h_{l−1} 的合理后继"这种情况设计的：权重 steering 改的是层与层之间的映射，边缘分布不变，相邻层的转移却可能变了。线性高斯版只需要多累计相邻层的交叉协方差，不用训练。
-  - 另一个对照：只用 LoRA 部分（去掉 embedding/lm_head）的 Δ 重做权重 steering，看崩坏是否主要来自共享的 embedding/lm_head。
+  - 用 M3 给 C2 的回答和 TinyMMLU 回答补打分（`SCORERS=trans OUT_NAME=scores_trans.parquet sbatch --array=0-2 slurm/c2_score.sbatch ...`，生成会跳过，每个任务约 10 分钟），G1 分析加上更灵敏的指标。
+  - 权重 steering 的处理：只用 LoRA 部分的 Δ（不动 embedding/lm_head）重做粗扫，看崩坏和谄媚还在不在、内部能不能检测到。这偏离上游配置，作为对照。
 - **单元测试**：`test_weight_steering.py`（k=0 时与原模型逐位相同、退出后参数恢复、共享权重一起变）和 `test_steering.py`（与 select_steerer 的挂法一致、答案解析）。
 
 ## 代码仓库结构
@@ -312,7 +346,7 @@ Manifold_Steering_LLM/
     calibrate.py              # 逐层分位数阈值、标准化、轨迹分数（已有）
     metrics.py                # AUROC（已有）
     plotting.py               # 画图的公共样式（已有）
-    trajectory/               # M3：data.py, model.py, train.py
+    trajectory/               # M3：model.py（线性高斯版，已有）；data.py、train.py 留给条件 flow 版
     reg.py                    # M4：训练时正则 ManifoldPenalty
   scripts/                    # 每个实验一个入口脚本（已有：generate_onpolicy_chat.py、collect_layer_stats.py、
                               #   check_layer_stats.py、compute_diffmean_vectors.py、train_lora.py、
@@ -336,7 +370,8 @@ Manifold_Steering_LLM/
 | `manifold_guard/calibrate.py` | 自然激活上的分数分位数 → 阈值 τ_l；标准化与轨迹分数 | 新写 | 0 | 80 |
 | `manifold_guard/metrics.py` | AUROC（GPU 上算平均秩，并列算一半） | 新写 | 0 | 20 |
 | `manifold_guard/plotting.py` | 画图的公共样式（参考色板、steering 强度横轴） | 新写 | 0 | 40 |
-| `manifold_guard/trajectory/` | 跨层条件先验 p(h_l \| h_{l-1}) 的数据、模型、训练 | GLP 的去噪器结构 | 2 后半 | 400 |
+| `manifold_guard/trajectory/` | 跨层条件先验 p(h_l \| h_{l-1}) 的数据、模型、训练；线性高斯版 `LinearGaussianTransition` 已有 | GLP 的去噪器结构 | 2 后半 | 400 |
+| `scripts/collect_pair_stats.py` | M3：相邻两层的联合均值与协方差（与逐层统计同一批 token） | 新写 | 0 | 110 |
 | `manifold_guard/reg.py` | 训练时离流形惩罚 `ManifoldPenalty` | 新写 | 2 后半 | 80 |
 | `manifold_guard/corpus.py` | 语料读取、按文档哈希切成 fit/calib/holdout、按长度打包 | 新写 | 0 | 130 |
 | `scripts/generate_onpolicy_chat.py` | vLLM 生成 on-policy 对话，保存 token id | 新写 | 0 | 100 |
@@ -740,7 +775,7 @@ class FlowTransition(TransitionPrior):
     """条件 flow matching：以 h_{l-1} 和层号为条件，对 Δ_l = h_l - h_{l-1} 建模。"""
 ```
 
-**线性高斯版（约 1 周）。** 把 `StreamingMoments` 扩展成相邻两层的联合矩：多累计一个交叉协方差 E[h_l h_{l−1}ᵀ]。由联合矩直接解出 A_l、b_l、S_l，不需要训练。7B 每对相邻层的交叉协方差约 100 MB（float64），27 对放在 Grace 的 CPU 内存里没有压力。
+**线性高斯版（已实现，见阶段 0 进展）。** 把 `StreamingMoments` 扩展成相邻两层的联合矩：多累计一个交叉协方差 E[h_l h_{l−1}ᵀ]。由联合矩直接解出 A_l、b_l、S_l，不需要训练。7B 每对相邻层的交叉协方差约 100 MB（float64），27 对放在 Grace 的 CPU 内存里没有压力。
 
 **条件 flow 版（约 3–4 周）：**
 
@@ -860,6 +895,7 @@ M4 与 M3 的后半段重叠：M3 的 flow 模型训练时，人力转去写 M4�
 - [x] `test_scorers`：在合成高斯数据上，马氏距离服从卡方分布；落在主子空间内的点 PCA 残差为 0；校准后 z 的中位数为 0、四分位距为 1；AUROC 与 sklearn 一致。
 - [ ] `test_glp_wrapper`：u 趋近 0 时 `glp_sdedit` 的输出约等于输入。
 - [x] `test_task_vectors`：k=0 时合并模型的 logits 与原模型相同（见 `tests/test_weight_steering.py`）。
+- [x] `test_transition`：线性高斯转移能从联合矩恢复 A、b、S；自然样本上分数服从 χ²/d；每层边缘分布不变、只有转移变了时，逐层打分器 AUROC 0.5，转移打分器 > 0.95。
 - [ ] `test_diffmean`：有 persona_vectors 的 `.pt` 时，自算向量与它的余弦相似度 ≥ 0.99。
 
 | 风险 | 早期信号 | 应对 |

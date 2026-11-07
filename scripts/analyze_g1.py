@@ -36,7 +36,7 @@ TOLERANCE = 2.0  # 两个半程点相差在 2 倍以内算对得上（粗扫网�
 
 
 def load_scores(root, configs, source):
-    frames = [pq for n in configs if (pq := root / n / "scores.parquet").exists()]
+    frames = [f for n in configs for f in sorted((root / n).glob("scores*.parquet"))]  # 新打分器可能单独存一个文件
     if not frames:
         return pd.DataFrame()
     df = pd.concat([pd.read_parquet(p) for p in frames], ignore_index=True)
