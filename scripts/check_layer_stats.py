@@ -71,7 +71,7 @@ def plot(results, spectra, meta, out_path):
             ax.spines[side].set_visible(False)
         for side in ("left", "bottom"):
             ax.spines[side].set_color(axis)
-        ax.tick_params(colors=muted, labelsize=8)
+        ax.tick_params(which="both", colors=muted, labelsize=8)  # 对数轴的副刻度标签也要统一
 
     roles = list(results)
     fig = plt.figure(figsize=(14, 9), facecolor=surface)
