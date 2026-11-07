@@ -141,8 +141,46 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
 
 ### 下一步
 
-1. 阶段 0 MVP（Qwen2.5-1.5B-Instruct）：1.5B 的逐层统计已完成。接下来做高斯与 PCA 打分器、阈值校准（PCA 的 k 要重新考虑，见模块 1 的"进展"）；用 weight-steering 的数据算 sycophancy 的激活 steering 向量与权重 steering 向量。
+1. 阶段 0 MVP（Qwen2.5-1.5B-Instruct）：1.5B 的逐层统计已完成，按下面"阶段 0：1.5B 实验计划"进行。
 2. 扫描 k，teacher-forcing 打分，画出"每层离流形分数 / 行为指标 / 能力指标"随 k 的曲线，判定 G1。
+
+### 阶段 0：1.5B 实验计划（2026-11-07 确定）
+
+目标是 G1：在 Qwen2.5-1.5B-Instruct 上，离流形分数的拐点与能力崩坏的拐点对得上，同时拿到谄媚行为随 k 的曲线。原则是先把流程跑通：先只测能力做粗扫，确认流程能用，再做细扫和 judge 评测。
+
+**沿用 weight-steering 的设置：**
+
+- **D⁺ / D⁻**：`cfierro/pv-prompts-sycophantic_Qwen2.5-1.5B-Instruct` 和 `cfierro/pv-prompts-non-sycophantic_Qwen2.5-1.5B-Instruct`，各 519 条两轮对话（user + assistant）。
+- **LoRA 超参**（`axolotl_configs/qwen-2.5-1.5b (GCD)/lora-*-pv_prompts.yml`）：
+  - r=32、α=16、dropout 0，所有线性层，`embed_tokens` 和 `lm_head` 全量训练。
+  - lr 1e-5，每卡 batch 2 × 梯度累积 4，100 步，warmup 5 步，linear 调度，weight decay 0.01。
+  - 留 5% 做验证，每 20 步评估一次，保留验证 loss 最好的检查点。
+  - 只在回答部分算 loss。
+- **权重 steering**：θ = θ_base + k(θ⁺ − θ⁻)。上游没有给出 1.5B 的 k 值。
+- **激活 steering**：默认在第 17 层（`vector[17]` 加在 `model.layers[16]` 上），另有全层版本，只作用在 response 位置。
+- **评测**：生成时 temperature 1.0、top_p 1.0、最多 600 个新 token。TinyMMLU 按上游 MMLU 的要求用贪心解码、最多 3000 个新 token，按 "Final Answer: X" 规则解析答案。
+
+**本项目的决定：**
+
+- **共享的 embedding 保持共享。** 1.5B 的 `embed_tokens` 与 `lm_head` 共用权重（7B 不共用）。用 peft 的 `ensure_weight_tying=True` 只训一份。
+- **基座以 float32 加载、bf16 autocast 训练。** lr 1e-5 时，全量训练的 embedding 每步更新远小于 bf16 的分辨率，以 bf16 存参数会把更新舍掉。
+- **θ⁺ − θ⁻ 在 float32 里算一次存下来。** 扫描时在显存里给模型加上 kΔ，用完恢复，不为每个 k 落盘。原因有两个：合并后以 bf16 存的模型会把很小的 Δ 量化掉；每个 k 都存一份完整模型也太慢。
+- **激活 steering 向量**用同一份 D⁺/D⁻，在回答 token 上求均值差，格式与 persona 向量一致（第 0 行为 embedding 层）。
+- **激活系数用相对大小表示**：c_rel = c·‖v_l‖ / 该层 response 范数中位数，不同层之间可以直接比较。
+- **两种方法都用 HF 生成。** 激活 steering 只能在 HF 里挂 hook，权重 steering 也用 HF，生成路径保持一致。
+- **judge** 通过 OpenAI 兼容接口调用，接口地址、模型名和 key 都由环境变量提供，不写进仓库、日志或结果文件。judge 不需要 GPU，在登录节点上运行。因为换了 judge，谄媚率的绝对值不与论文直接比较，只比较不同 k、不同方法之间的相对差异。
+- **不改上游代码**，只从上游导入 `ActivationSteerer` 和 judge 模板。数据集从缓存里的 parquet 直接读取：上游的 `load_dataset` 在离线作业里会失败。
+
+**步骤：**
+
+| 步骤 | 内容 | 运行方式 | 估计耗时 |
+| --- | --- | --- | --- |
+| A1 | `compute_diffmean_vectors.py`：从 D⁺/D⁻ 算激活 steering 向量 | 交互会话 | 几分钟 |
+| B | `train_lora.py`（trl + peft）训练 τ⁺、τ⁻，lr 取 5e-6、1e-5、2e-5，按验证 loss 选；再算 Δ = θ⁺ − θ⁻ | 冒烟测试在交互会话，正式训练提交作业 | 约 30 分钟，1 卡 |
+| C1 | 粗扫，只测 TinyMMLU：权重 k ∈ {0, ±2, ±5, ±10, ±20, ±30}；第 17 层与全层激活 c_rel ∈ {0, ±0.25, ±0.5, ±1, ±2, ±4} | 提交作业 | 约 1 小时，1 卡 |
+| A2 | 打分器（norm、gauss、pca）、`calibrate.py`、`validate_scorers.py`（PCA 的 k 试 90%/95%/99% 方差三档） | 交互会话 | 几分钟 |
+| C2 | 细扫：在崩坏区间取约 9 个点 × 三种方法，在 500 条谄媚子集和 TinyMMLU 上生成并逐层打分，另做 k=0 基线和"原模型给 steering 后的文本打分"两个对照 | 作业数组 | 约 2 小时 GPU |
+| D | judge 评测（约 27 个配置 × 500 条）与分析，判定 G1 | judge 在登录节点 | 视接口速率而定 |
 
 ## 代码仓库结构
 
