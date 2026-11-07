@@ -145,6 +145,7 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
 | 导入上游代码后，`third_party/weight-steering` 显示有改动 | Python 往 submodule 里写了 `__pycache__` | `manifold_guard/upstream.py` 导入上游模块时关闭字节码写入 |
 | Qwen 的 text 角色第 1–25 层最大特征值约 4700、参与比只有 1.4–2；约十万分之四的 token 范数是中位数的 200 倍以上 | Qwen 的 tokenizer 不加 BOS，FineWeb 文档以数字开头时，attention sink 落在第 1–4 个 token 上，去掉首 token 挡不住；这 0.004% 的 token 占了第 1–14 层 E‖x‖² 的 61%–70% | `iter_fineweb` 在文档前补 `model.config.bos_token_id`（Qwen 为 `<\|endoftext\|>`），实测大范数 token 降为 0；`check_layer_stats.py` 会报出这类 token |
 | LoRA 训练第 2 步起 grad_norm 为 NaN，之后 loss 变成 0 | bf16 autocast 加 sdpa 注意力，batch 里有 padding 时反向传播出 NaN；与 peft 设置、梯度检查点、优化器都无关（纯 float32、eager 注意力、batch 1 都正常） | `train_lora.py` 全程 float32 |
+| 训练作业（4974430、4974998）的任务都报 `SFTTrainer does not support nn.DataParallel` | 在 Arrhenius 上，sbatch 里写了 `-N 1` 的作业会分到整台节点的 4 块 GPU（`SLURM_JOB_GPUS=0,1,2,3`），不写 `-N` 时 `--gpus=1` 只分 1 块；Trainer 看到多块想用 DataParallel，trl 拒绝。VS Code 作业没写 `-N`，所以冒烟测试没暴露 | 单卡作业的 sbatch 不写 `-N`（只有 `ddp_smoke.sbatch` 要整节点）；所有 sbatch 先 source `slurm/one_gpu.sh`，看到多块时只用分到的第一块，并在日志开头打印 GPU 情况 |
 | pytest 之后 `.pytest_tmp/` 里手动放的文件不见了 | `--basetemp` 每次运行前会清空该目录 | 冒烟测试的输出不要放在 `.pytest_tmp/` 里过夜 |
 | on-policy 回答的采样参数与评测不一致 | vLLM 默认用模型的 generation_config（Qwen2.5：temperature 0.7、top_p 0.8） | 生成脚本改用 weight-steering 评测的设置：temperature 1.0、top_p 1.0、最多 600 个新 token |
 
@@ -155,7 +156,7 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
 
 ### 阶段 0：1.5B 实验计划（2026-11-07 确定）
 
-目标是 G1：在 Qwen2.5-1.5B-Instruct 上，离流形分数的拐点与能力崩坏的拐点对得上，同时拿到谄媚行为随 k 的曲线。原则是先把流程跑通：先只测能力做粗扫，确认流程能用，再做细扫和 judge 评测。
+目标是 G1：在 Qwen2.5-1.5B-Instruct 上，离流形分数的拐点与能力崩坏的拐点对得上，同时拿到谄媚行为随 k 的曲线。原则是先把流程跑通：先只测能力做粗扫，确认流程能用，再沿用粗扫的网格做打分和 judge 评测，不另做细扫。
 
 **沿用 weight-steering 的设置：**
 
@@ -192,8 +193,8 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
 | B | `train_lora.py`（trl + peft）训练 τ⁺、τ⁻，lr 取 5e-6、1e-5、2e-5（`slurm/train_lora.sbatch`，作业数组）；`make_weight_delta.py` 按验证 loss 各选一个，算 Δ = θ⁺ − θ⁻ | 冒烟测试在交互会话，正式训练提交作业 | 每个 2–3 分钟，1 卡 |
 | C1 | 粗扫，只测 TinyMMLU（`sweep_capability.py`、`slurm/sweep_coarse.sbatch`）：权重 k ∈ {0, ±2, ±5, ±10, ±20, ±30}；第 17 层与全层激活 c_rel ∈ {0, ±0.05, ±0.1, ±0.25, ±0.5, ±1, ±2}（冒烟测试里 c_rel=1 已完全崩坏，所以从 0.05 起） | 提交作业 | 约 1 小时，1 卡 |
 | A2 | 打分器（norm、gauss、pca）、`calibrate.py`、`validate_scorers.py`（PCA 的 k 试 90%/95%/99% 方差三档） | 交互会话 | 几分钟 |
-| C2 | 细扫：在崩坏区间取约 9 个点 × 三种方法，在 500 条谄媚子集和 TinyMMLU 上生成并逐层打分，另做 k=0 基线和"原模型给 steering 后的文本打分"两个对照 | 作业数组 | 约 2 小时 GPU |
-| D | judge 评测（约 27 个配置 × 500 条）与分析，判定 G1 | judge 在登录节点 | 视接口速率而定 |
+| C2 | 沿用粗扫网格（不另做细扫）：在 500 条谄媚子集上生成，与粗扫已存的 TinyMMLU 回答一起逐层打分，另做 k=0 基线和"原模型给 steering 后的文本打分"两个对照 | 作业数组 | 约 2 小时 GPU |
+| D | judge 评测（粗扫的配置 × 500 条）与分析，判定 G1 | judge 在登录节点 | 视接口速率而定 |
 
 **进展（2026-11-07）：**
 
@@ -202,7 +203,28 @@ mst() { apptainer exec --nv -B $PROJ $SIF /opt/venvs/train/bin/"$1" "${@:2}"; }
   - LoRA 训 10 步，两个适配器的验证 loss 都在下降，合并后共享的 embedding 仍是一份。
   - Δ 覆盖 197 个参数（28 层 × 7 个线性层，外加 embedding）。
   - 粗扫在 20 道题上跑通，基线准确率 0.60。
-- **下一步**：提交训练作业数组和粗扫作业。
+- **前两次提交训练（作业 4974430、4974998）都失败**：sbatch 里的 `-N 1` 让每个任务分到整台节点的 4 块 GPU，trl 拒绝训练，没有开始（见"踩过的坑"）。已去掉单卡作业的 `-N 1`，并加 `slurm/one_gpu.sh` 兜底。之前带 `-N 1` 的逐层统计作业也占了整台节点。
+- **B 已完成**（作业 4975341，每个任务 1 块 GPU，2–2.5 分钟）。100 步都没有 NaN，验证 loss 最好的检查点都在第 60–100 步：
+
+  | | lr 5e-6 | lr 1e-5 | lr 2e-5 |
+  | --- | --- | --- | --- |
+  | τ⁺（谄媚） | 1.6523 | 1.6072 | **1.6044** |
+  | τ⁻（不谄媚） | 1.4353 | **1.4333** | 1.4358 |
+
+  选中加粗的两个。τ⁻ 的验证 loss 只从 1.44 降到 1.43，说明 D⁻ 的回答本来就接近原模型自己的说法，Δ 主要来自 τ⁺。Δ 有 197 个参数有变化，‖Δ‖ = 1.55（`ckpt/Qwen2.5-1.5B-Instruct/sycophancy/delta.pt`）。
+- **C1 已完成**（作业 4975342，35 个配置，约 85 分钟）。结果在 `results/Qwen2.5-1.5B-Instruct/coarse/`，图是 `capability.png`（`scripts/plot_coarse.py` 画）。基线准确率 0.53，100 道题的标准误约 0.05。
+  - 三种方法都是"平台 + 断崖"：强度不大时准确率在基线附近，越过某一点后，一个粗扫步长内掉到 0.1 左右，回答写到 3000 token 上限。
+  - 能力断崖所在的区间：
+
+    | 方法 | 正方向 | 负方向 |
+    | --- | --- | --- |
+    | 权重 k | +2（0.55）到 +5（0.11） | 逐渐下降：−2 为 0.44，−5 为 0.34，−10 为 0.04 |
+    | 第 17 层激活 c_rel | +0.5（0.48）到 +1（0.04） | −0.5（0.48）到 −1（0.31）再到 −2（0） |
+    | 全层激活 c_rel | +0.25（0.53）到 +0.5（0.10） | −0.25（0.52）到 −0.5（0.16） |
+
+  - 正方向确实在放大谄媚：权重 k=+5 的回答不再答题，只剩"Oh, how wonderful! Your wisdom shines so brightly!"一类的奉承并不断重复。崩坏之前回答先变短：k=+2 平均 15 token，第 17 层 c_rel=+0.25 只剩"Final Answer: X"（基线 43 token）。负方向则是回答先变长。
+- **不做细扫（2026-11-07 决定）**：粗扫已经定出三种方法各自的崩坏区间，够判断拐点的大致位置，不再为加密网格多跑。C2 和 D 都沿用粗扫的 35 个配置，按计划往下走：A2 打分器 → 在粗扫配置上做 teacher-forcing 打分 → judge 评测与 G1 分析。粗扫里 TinyMMLU 的回答已经存盘，打分时直接用，不重新生成。
+- **下一步**：A2 打分器（交互会话）。
 - **单元测试**：`test_weight_steering.py`（k=0 时与原模型逐位相同、退出后参数恢复、共享权重一起变）和 `test_steering.py`（与 select_steerer 的挂法一致、答案解析）。
 
 ## 代码仓库结构
@@ -218,7 +240,7 @@ Manifold_Steering_LLM/
     generative_latent_prior/  # GLP 权重加载、sample_on_manifold
     persona_vectors/          # 为 Qwen 生成激活 steering 向量（.pt）
   containers/                 # 镜像定义文件与锁文件（已有）
-  slurm/                      # sbatch 模板（已有：ddp_smoke.sbatch、layer_stats.sbatch）
+  slurm/                      # sbatch 模板（已有：ddp_smoke、layer_stats、train_lora、sweep_coarse，以及共用的 one_gpu.sh）
   smoke/                      # 冒烟测试（已有）
   tools/                      # 模型与数据集下载脚本（已有）
   docs/                       # 本计划（已有）
@@ -267,6 +289,7 @@ Manifold_Steering_LLM/
 | `manifold_guard/weight_steering.py` | Δ 的计算与 `WeightSteerer`（显存里加 kΔ，不落盘） | `task_vectors.py` 的公式 | 0 | 70 |
 | `manifold_guard/steering.py` | 激活 steering 的挂法（同 `select_steerer`）、相对系数、TinyMMLU 解析 | `select_steerer`、`ActivationSteerer` | 0 | 90 |
 | `scripts/sweep_capability.py` | C1 粗扫：TinyMMLU 准确率随 k 的变化，可续跑 | 新写 | 0 | 150 |
+| `scripts/plot_coarse.py` | 画粗扫的能力曲线（每种方法一列），打印表格 | 新写 | 0 | 110 |
 | `scripts/compute_diffmean_vectors.py` | 从 D⁺/D⁻ 算激活 steering 向量（persona_vectors 格式） | 新写 | 0 | 100 |
 | `scripts/validate_scorers.py` | 打分器 AUROC 验证 | 新写 | 0–1 | 120 |
 | `scripts/sweep_weight_steering.py` | 循环 k：调 `task_vectors.py` → vLLM 生成 → judge | `inference_and_eval.py` | 0–1 | 150 |
