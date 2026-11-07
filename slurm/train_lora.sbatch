@@ -7,7 +7,6 @@
 # 输出 ckpt/<模型名>/<行为>/{pos,neg}_lr<学习率>/（adapter/ 与 meta.json）
 #SBATCH -A naiss2026-4-1521-gpu
 #SBATCH -p gpu
-#SBATCH -N 1
 #SBATCH --gpus=1
 #SBATCH -t 00:45:00
 #SBATCH -J train-lora
@@ -31,6 +30,7 @@ export HF_HOME=$BASE/hf_cache HF_HUB_OFFLINE=1
 
 echo "节点: $(hostname)   作业: ${SLURM_ARRAY_JOB_ID}_$i   $ROLE  lr=$LR   数据: $DATA   开始: $(date)"
 echo "镜像: $(readlink -f "$SIF")"
+source "$REPO/slurm/one_gpu.sh"
 cd "$REPO"
 apptainer exec --nv -B "$BASE" "$SIF" /opt/venvs/train/bin/python scripts/train_lora.py \
   --model "$MODEL" --dataset "$DATA" --lr "$LR" --out "$OUT"

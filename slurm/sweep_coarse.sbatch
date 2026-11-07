@@ -8,7 +8,6 @@
 # 输出 results/<模型名>/coarse/；中断后重新提交会跳过已完成的配置。
 #SBATCH -A naiss2026-4-1521-gpu
 #SBATCH -p gpu
-#SBATCH -N 1
 #SBATCH --gpus=1
 #SBATCH -t 03:00:00
 #SBATCH -J sweep-coarse
@@ -31,6 +30,7 @@ export HF_HOME=$BASE/hf_cache HF_HUB_OFFLINE=1
 
 echo "节点: $(hostname)   作业: $SLURM_JOB_ID   模型: $MODEL   开始: $(date)"
 echo "镜像: $(readlink -f "$SIF")"
+source "$REPO/slurm/one_gpu.sh"
 cd "$REPO"
 run() { apptainer exec --nv -B "$BASE" "$SIF" python "$@"; }
 

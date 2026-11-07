@@ -5,7 +5,6 @@
 # 7B 模型建议加大时限：sbatch -t 04:00:00 slurm/layer_stats.sbatch Qwen/Qwen2.5-7B-Instruct
 #SBATCH -A naiss2026-4-1521-gpu
 #SBATCH -p gpu
-#SBATCH -N 1
 #SBATCH --gpus=1
 #SBATCH -t 02:00:00
 #SBATCH -J layer-stats
@@ -26,6 +25,7 @@ export HF_HOME=$BASE/hf_cache HF_HUB_OFFLINE=1 VLLM_USE_FLASHINFER_SAMPLER=0
 
 echo "节点: $(hostname)   作业: $SLURM_JOB_ID   模型: $MODEL   开始: $(date)"
 echo "镜像: $(readlink -f "$SIF")"
+source "$REPO/slurm/one_gpu.sh"
 cd "$REPO"
 run() { apptainer exec --nv -B "$BASE" "$SIF" python "$@"; }
 
